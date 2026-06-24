@@ -1,0 +1,194 @@
+# =============================================================================
+# Ultimate RAG — runtime configuration
+# Non-secret structure lives here. Secrets/DSNs come from env (.env), prefix RAG_,
+# nested keys delimited by "__" (e.g. RAG_LLM__API_KEY). Env overrides YAML.
+# =============================================================================
+
+app:
+  name: "ultimate-rag"
+  env: "dev"            # dev | staging | prod
+  debug: true
+
+logging:
+  level: "DEBUG"            # our app.* loggers (received query, LLM prompt/messages/params, etc.)
+  third_party_level: "WARNING"   # sqlalchemy / httpx / aiosqlite / etc. — raise to DEBUG to see them
+  sql_echo: false          # SQLAlchemy engine SQL echo (very noisy)
+  rich: true
+  log_dir: "logs"
+  file: "app.log"
+  truncate: false
+  rotation_mb: 50
+  backups: 5
+  noisy_loggers: ["sqlalchemy", "sqlalchemy.engine", "aiosqlite", "httpcore", "httpx", "openai", "neo4j", "urllib3", "asyncio", "qdrant_client"]
+
+observability:
+  mlflow:
+    enabled: false
+    tracking_uri: "http://localhost:5000"
+    experiment: "ultimate-rag"
+    autolog:
+      langchain: true   # covers LangGraph
+      openai: true
+      litellm: false
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins: ["*"]
+
+# No auth layer. Callers pass an X-User-Id header; every repository still
+# filters on it for tenant isolation. Absent header → user "default".
+
+database:
+  provider: "sqlite"               # postgres | sqlite
+  # Postgres: relational + pgvector + AGE all in one DB.
+  dsn: "postgresql+asyncpg://rag:rag@localhost:5432/rag"
+  pool_size: 10
+  max_overflow: 20
+  # SQLite (provider: sqlite) — zero-infra relational store, file path below.
+  # Note: pgvector and AGE are Postgres-only; pair sqlite with vector_store=chroma/qdrant.
+  sqlite_path: "rag.db"
+
+# --- Vector store -----------------------------------------------------------
+vector_store:
+  # Capability-aware: pgvector & chroma = semantic only; qdrant = semantic + BM25.
+  # Requesting bm25/hybrid on a semantic-only store is rejected (no FTS fake-out).
+  provider: "qdrant"                 # pgvector | qdrant | chroma
+  collection: "rag_chunks"
+  embedding_dim: 1024
+  distance: "cosine"                 # cosine | dot | euclidean
+  # qdrant
+  qdrant_url: "http://localhost:6333"
+  qdrant_api_key: null
+  enable_sparse: true                # BM25/sparse vectors (Qdrant only)
+  sparse_model: "Qdrant/bm25"        # fastembed model id
+  # pgvector
+  pgvector_table: "chunk_vectors"
+  # chroma (local persistent, semantic only — zero infra)
+  chroma_path: "chroma_data"
+
+# --- Knowledge graph (Phase 2; scaffolded now) ------------------------------
+graph_store:
+  enabled: true
+  provider: "memgraph"                    # age (needs Postgres) | memgraph (Bolt, standalone)
+  graph_name: "rag_kg"               # AGE only
+  # memgraph (docker run -p 7687:7687 memgraph/memgraph-mage) — no storage backend to set up
+  memgraph_url: "bolt://localhost:7687"
+  memgraph_user: ""
+  memgraph_password: ""
+
+# --- Query cache ------------------------------------------------------------
+cache:
+  enabled: false
+  provider: "ignite"                 # ignite | redis (later)
+  ttl_seconds: 3600
+  ignite_addresses: ["127.0.0.1:10800"]
+  cache_name: "rag_query_cache"
+  namespace: "qcache"
+
+# --- Embeddings -------------------------------------------------------------
+embeddings:
+  provider: "ollama"           # azure_openai | openai | ollama
+  model: "mxbai-embed-large:latest"  # no-NaN on Turing GPUs; 512-token limit handled by max_input_tokens
+  dim: 1024
+  batch_size: 64
+  max_input_tokens: 300        # tiktoken cap; ~450-500 mxbai (SentencePiece) tokens < 512 limit. null for big-context models.
+  # azure_openai
+  azure_endpoint: null
+  azure_deployment: null
+  api_version: "2024-06-01"
+  api_key: null                      # via env
+  # ollama
+  ollama_base_url: "http://localhost:11434"
+
+# --- LLM --------------------------------------------------------------------
+llm:
+  provider: "ollama"                 # openai | ollama | vllm  (all OpenAI-compatible)
+  model: "gemma3:4b"
+  base_url: "http://localhost:11434/v1"  # OPENAI_BASE_URL env overrides (openai/vllm only)
+  api_key: null                      # set OPENAI_API_KEY in env (used only when provider=openai)
+  temperature: 0.1
+  max_tokens: 1024
+  timeout_s: 60
+  max_retries: 3
+  structured_output: "instructor"    # instructor | native_tools
+
+# --- Reranker ---------------------------------------------------------------
+reranker:
+  enabled: false
+  provider: "bge"                    # bge | qwen3 | cohere
+  model: "BAAI/bge-reranker-v2-m3"
+  top_n: 8
+  endpoint: "http://localhost:8080"  # TEI endpoint (null = run locally)
+
+# --- Document parsing -------------------------------------------------------
+parsing:
+  backend: "custom"                  # docling | custom
+  docling:
+    url: "http://localhost:5001"     # docling-serve
+    do_ocr: true
+    do_table_structure: true
+  custom:
+    ocr_engine: "rapidocr"           # rapidocr | tesseract
+    ocr_languages: ["en"]
+    pdf_image_ocr_threshold: 0.1     # text-density below which we OCR a page
+
+# --- Chunking ---------------------------------------------------------------
+chunking:
+  strategy: "recursive"              # fixed | recursive | document_aware | semantic
+  chunk_size: 300                    # tiktoken tokens; aligned with embeddings.max_input_tokens (mxbai 512 limit)
+  chunk_overlap: 48
+  unit: "token"                      # char | word | sentence | token
+  semantic_threshold: 0.6            # only for semantic strategy
+
+# --- Enrichment (all toggleable) --------------------------------------------
+enrichment:
+  image_captioning:
+    enabled: false
+    model: "gpt-4o"
+  table_extraction:
+    enabled: true
+    summarize: true
+  metadata_extraction:
+    enabled: true                   # LLM-extracted metadata at ingest
+    fields: ["title", "author", "doc_type", "topics"]
+  contextual_retrieval:
+    enabled: false                   # prepend doc-level context to each chunk
+
+# --- Retrieval --------------------------------------------------------------
+retrieval:
+  default_mode: "graph"             # semantic | bm25 | graph | hybrid | hybrid_graph
+  top_k: 20
+  fusion: "rrf"                      # rrf | weighted
+  rrf_k: 60
+  weights: { dense: 0.6, sparse: 0.4 }
+  rerank_top_k: 8
+
+# --- Agent ------------------------------------------------------------------
+agent:
+  enabled: true
+  style: "graph"                     # graph (fixed state-machine) | tools (ReAct tool-calling) | deep (deepagents: planner+subagents) — tools/deep need a strong LLM
+  query_rewrite: true
+  decompose: true
+  max_subqueries: 4
+  grade_relevance: true
+  max_retrieval_loops: 2
+  context_exploration: false         # retrieve a few snippets first to ground rewrite/decompose
+  context_exploration_top_k: 3
+  tools:
+    max_tool_calls: 8                # hard budget for the tools agent (prevents runaway loops)
+  auto_filter:
+    enabled: false                   # LLM infers metadata filters from the query (applies to /query and /chat)
+    fields: ["doc_type", "author"]   # only these metadata fields may be auto-filtered
+
+# --- Ingestion (in-process: background task or POST /ingest/sync) -----------
+ingestion:
+  max_file_mb: 100
+  dedup_by_hash: true
+
+# --- Chat sessions ----------------------------------------------------------
+chat:
+  memory_enabled: true
+  max_turns: 20
+  checkpointer: "memory"           # postgres | memory | sqlite
+  sqlite_path: "chat_memory.db"    # used when checkpointer = sqlite (zero-infra persistence)

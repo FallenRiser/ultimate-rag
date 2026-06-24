@@ -1,0 +1,85 @@
+[project]
+name = "ultimate-rag"
+version = "0.1.0"
+description = "Enterprise agentic, multi-retrieval RAG platform."
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    # --- API ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",      # file uploads
+    # --- config & models ---
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    # --- graph store (optional) ---
+    "neo4j>=5.0",                   # Bolt driver — also used for Memgraph
+    # --- agent / orchestration ---
+    "langgraph>=0.2",
+    "langgraph-checkpoint-postgres>=2.0",
+    "langgraph-checkpoint-sqlite>=2.0",   # sqlite chat memory
+    "langchain-core>=0.3",
+    "langchain-openai>=0.2",              # tool-calling agent (agent.style=tools)
+    "deepagents>=0.5",                    # planner + sub-agents agent (agent.style=deep)
+    # --- structured output ---
+    "instructor>=1.5",
+    # --- llm / embedding clients ---
+    "openai>=1.40",                 # OpenAI + Azure + vLLM (OpenAI-compatible)
+    "ollama>=0.3",
+    # --- vector stores ---
+    "qdrant-client>=1.11",
+    "fastembed>=0.3",               # BM25 / sparse vectors
+    "pgvector>=0.3",
+    "chromadb>=0.5",                # local semantic-only vector store
+    # --- relational ---
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.29",                # postgres driver
+    "aiosqlite>=0.20",              # sqlite driver
+    "alembic>=1.13",
+    # --- cache ---
+    "pyignite>=0.6",                # Apache Ignite (default cache)
+    # --- observability ---
+    "mlflow>=2.16",
+    "rich>=13.7",
+    # --- misc ---
+    "httpx>=0.27",                  # docling-serve / TEI clients
+    "tiktoken>=0.7",                # token-aware chunking
+]
+
+[project.optional-dependencies]
+# Custom (no-GPU) document extraction backend
+parsing = [
+    "pypdf>=4.3",
+    "python-docx>=1.1",
+    "python-pptx>=0.6",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+    "pillow>=10.4",
+    "rapidocr-onnxruntime>=1.3",    # OCR for image-based PDFs/scans
+]
+# Docling-serve is called over HTTP (httpx); local docling optional:
+docling = ["docling>=2.0"]
+# Local reranking (instead of a TEI endpoint)
+rerank-local = ["FlagEmbedding>=1.2"]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
