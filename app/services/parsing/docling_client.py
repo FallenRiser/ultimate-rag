@@ -26,17 +26,18 @@ def _check_mutually_exclusive(options: Dict[str, Any]) -> None:
             raise ValueError(f"docling options {conflicting} are mutually exclusive; set only one")
 
 
-def _to_multipart(form: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """Flatten the options dict into multipart fields; list values become repeated keys."""
-    fields: List[Tuple[str, str]] = []
+def _to_form(form: Dict[str, Any]) -> Dict[str, Any]:
+    """Build httpx multipart form fields: drop None, bools → "true"/"false", list values
+    kept as lists so httpx emits them as repeated keys. Must be a dict (not a list of
+    tuples) — a list makes httpx build a sync stream that AsyncClient rejects."""
+    fields: Dict[str, Any] = {}
     for key, value in form.items():
         if value is None:
             continue
         if isinstance(value, list):
-            for item in value:
-                fields.append((key, _encode(item)))
+            fields[key] = [_encode(item) for item in value]
         else:
-            fields.append((key, _encode(value)))
+            fields[key] = _encode(value)
     return fields
 
 
@@ -106,7 +107,7 @@ class DoclingParser(BaseDocumentParser):
         async with httpx.AsyncClient(timeout=read_timeout) as client:
             response = await client.post(
                 f"{self.url}/v1/convert/file",
-                data=_to_multipart(merged),
+                data=_to_form(merged),
                 files={"files": (filename, file_bytes, mime_type)},
             )
             response.raise_for_status()
