@@ -93,8 +93,9 @@ embeddings:
   dim: 1024
   batch_size: 64
   max_input_tokens: 300        # tiktoken cap; ~450-500 mxbai (SentencePiece) tokens < 512 limit. null for big-context models.
-  # azure_openai
-  azure_endpoint: null
+  # azure_openai — set the full deployment URL + key in .env (RAG_EMBEDDINGS__AZURE_URL, RAG_EMBEDDINGS__API_KEY)
+  azure_url: null              # https://<res>.openai.azure.com/openai/deployments/<dep>/embeddings?api-version=2024-06-01
+  azure_endpoint: null         # fallback if azure_url unset
   azure_deployment: null
   api_version: "2024-06-01"
   api_key: null                      # via env
@@ -125,19 +126,38 @@ parsing:
   backend: "custom"                  # docling | custom
   docling:                           # any of these can be overridden per-request via parser_options
     url: "http://localhost:5001"     # docling-serve
-    to_formats: ["md"]               # md | json | html | text | doctags
+    target_type: "inbody"            # inbody | zip
+    to_formats: ["md"]               # md | json | yaml | html | text | doctags
     from_formats: null               # null = all input formats
     do_ocr: true
     force_ocr: false
-    ocr_engine: "easyocr"            # easyocr | tesseract | rapidocr
+    ocr_engine: "easyocr"            # auto | easyocr | tesseract | rapidocr | ocrmac | tesserocr
     ocr_lang: null                   # e.g. ["en"]; null = engine default
-    pdf_backend: "dlparse_v2"        # dlparse_v2 | dlparse_v1 | pypdfium2
+    pdf_backend: "dlparse_v2"        # pypdfium2 | dlparse_v1 | dlparse_v2 | dlparse_v4
     table_mode: "fast"               # fast | accurate
+    table_cell_matching: true
     do_table_structure: true
+    pipeline: "standard"             # standard | vlm | asr | legacy
     image_export_mode: "placeholder" # placeholder | embedded | referenced
-    abort_on_error: false
-    return_as_file: false
+    include_images: true
+    images_scale: 2.0
+    md_page_break_placeholder: ""    # e.g. "<!-- page-break -->"
+    page_range: null                 # [start, end] 1-indexed; null = all pages
     document_timeout: null           # max seconds per document (null = server default)
+    abort_on_error: false
+    # Enrichment (each off by default — adds latency/model cost)
+    do_code_enrichment: false
+    do_formula_enrichment: false
+    do_picture_classification: false
+    do_chart_extraction: false
+    do_picture_description: false
+    picture_description_area_threshold: 0.05
+    # Advanced VLM / picture-description models — JSON strings (see docling API examples); null = unused
+    picture_description_local: null
+    picture_description_api: null
+    vlm_pipeline_model: null
+    vlm_pipeline_model_local: null
+    vlm_pipeline_model_api: null
   custom:
     ocr_engine: "rapidocr"           # rapidocr | tesseract
     ocr_languages: ["en"]
@@ -195,6 +215,7 @@ agent:
 ingestion:
   max_file_mb: 100
   dedup_by_hash: true
+  storage_dir: "uploads"           # POST /ingest/upload saves files under uploads/{user_id}/{version}/
 
 # --- Chat sessions ----------------------------------------------------------
 chat:

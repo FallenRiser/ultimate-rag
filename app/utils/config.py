@@ -125,10 +125,13 @@ class EmbeddingsSettings(BaseModel):
     dim: int = 3072
     batch_size: int = 64
     max_input_tokens: Optional[int] = None  # client-side truncation (small-context models e.g. mxbai=512)
+    # Azure: either a full deployment URL (deployment + api-version embedded) via env
+    # RAG_EMBEDDINGS__AZURE_URL, or the separate fields below. URL wins when set.
+    azure_url: Optional[str] = None   # e.g. https://r.openai.azure.com/openai/deployments/<dep>/embeddings?api-version=2024-06-01
     azure_endpoint: Optional[str] = None
     azure_deployment: Optional[str] = None
     api_version: str = "2024-06-01"
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None     # via env RAG_EMBEDDINGS__API_KEY
     ollama_base_url: str = "http://localhost:11434"
 
 
@@ -152,20 +155,41 @@ class RerankerSettings(BaseModel):
 
 
 class DoclingSettings(BaseModel):
+    """Defaults for docling-serve /v1/convert/file. Any field is overridable per-request
+    via the ingestion API's `parser_options` (which also accepts params not listed here)."""
     url: str = "http://localhost:5001"
-    to_formats: List[str] = ["md"]              # md | json | html | text | doctags
+    target_type: str = "inbody"                 # inbody | zip
+    to_formats: List[str] = ["md"]              # md | json | yaml | html | text | doctags
     from_formats: Optional[List[str]] = None    # None = all (pdf, docx, pptx, xlsx, html, image, …)
     do_ocr: bool = True
     force_ocr: bool = False
-    ocr_engine: str = "easyocr"                 # easyocr | tesseract | rapidocr | …
+    ocr_engine: str = "easyocr"                 # auto | easyocr | tesseract | rapidocr | ocrmac | tesserocr
     ocr_lang: Optional[List[str]] = None        # e.g. ["en"]; None = engine default
-    pdf_backend: str = "dlparse_v2"             # dlparse_v2 | dlparse_v1 | pypdfium2
+    pdf_backend: str = "dlparse_v2"             # pypdfium2 | dlparse_v1 | dlparse_v2 | dlparse_v4
     table_mode: str = "fast"                    # fast | accurate
+    table_cell_matching: bool = True
     do_table_structure: bool = True
+    pipeline: str = "standard"                  # standard | vlm | asr | legacy
     image_export_mode: str = "placeholder"      # placeholder | embedded | referenced
-    abort_on_error: bool = False
-    return_as_file: bool = False
+    include_images: bool = True
+    images_scale: float = 2.0
+    md_page_break_placeholder: str = ""         # e.g. "<!-- page-break -->"
+    page_range: Optional[List[int]] = None      # [start, end], 1-indexed; None = all pages
     document_timeout: Optional[float] = None    # max seconds per document (None = server default)
+    abort_on_error: bool = False
+    # Enrichment toggles (all default off; each adds latency/model cost)
+    do_code_enrichment: bool = False
+    do_formula_enrichment: bool = False
+    do_picture_classification: bool = False
+    do_chart_extraction: bool = False
+    do_picture_description: bool = False
+    picture_description_area_threshold: float = 0.05
+    # Advanced VLM / picture-description models — JSON strings per docling's API examples
+    picture_description_local: Optional[str] = None
+    picture_description_api: Optional[str] = None
+    vlm_pipeline_model: Optional[str] = None
+    vlm_pipeline_model_local: Optional[str] = None
+    vlm_pipeline_model_api: Optional[str] = None
 
 
 class CustomParsingSettings(BaseModel):
@@ -254,6 +278,7 @@ class AgentSettings(BaseModel):
 class IngestionSettings(BaseModel):
     max_file_mb: int = 100
     dedup_by_hash: bool = True
+    storage_dir: str = "uploads"   # uploaded files saved under {storage_dir}/{user_id}/{version}/
 
 
 class ChatSettings(BaseModel):

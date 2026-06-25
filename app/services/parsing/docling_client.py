@@ -12,6 +12,20 @@ def _encode(value: Any) -> str:
     return str(value)
 
 
+# docling treats these as mutually exclusive (per its API docs); at most one per group.
+_MUTUALLY_EXCLUSIVE: List[Tuple[str, ...]] = [
+    ("picture_description_local", "picture_description_api"),
+    ("vlm_pipeline_model", "vlm_pipeline_model_local", "vlm_pipeline_model_api"),
+]
+
+
+def _check_mutually_exclusive(options: Dict[str, Any]) -> None:
+    for group in _MUTUALLY_EXCLUSIVE:
+        conflicting = [key for key in group if options.get(key) not in (None, "")]
+        if len(conflicting) > 1:
+            raise ValueError(f"docling options {conflicting} are mutually exclusive; set only one")
+
+
 def _to_multipart(form: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Flatten the options dict into multipart fields; list values become repeated keys."""
     fields: List[Tuple[str, str]] = []
@@ -40,6 +54,7 @@ class DoclingParser(BaseDocumentParser):
     def _build_options(self, overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         cfg = self.settings
         options: Dict[str, Any] = {
+            "target_type": cfg.target_type,
             "to_formats": cfg.to_formats,
             "from_formats": cfg.from_formats,
             "do_ocr": cfg.do_ocr,
@@ -48,13 +63,30 @@ class DoclingParser(BaseDocumentParser):
             "ocr_lang": cfg.ocr_lang,
             "pdf_backend": cfg.pdf_backend,
             "table_mode": cfg.table_mode,
+            "table_cell_matching": cfg.table_cell_matching,
             "do_table_structure": cfg.do_table_structure,
+            "pipeline": cfg.pipeline,
             "image_export_mode": cfg.image_export_mode,
-            "abort_on_error": cfg.abort_on_error,
-            "return_as_file": cfg.return_as_file,
+            "include_images": cfg.include_images,
+            "images_scale": cfg.images_scale,
+            "md_page_break_placeholder": cfg.md_page_break_placeholder,
+            "page_range": cfg.page_range,
             "document_timeout": cfg.document_timeout,
+            "abort_on_error": cfg.abort_on_error,
+            "do_code_enrichment": cfg.do_code_enrichment,
+            "do_formula_enrichment": cfg.do_formula_enrichment,
+            "do_picture_classification": cfg.do_picture_classification,
+            "do_chart_extraction": cfg.do_chart_extraction,
+            "do_picture_description": cfg.do_picture_description,
+            "picture_description_area_threshold": cfg.picture_description_area_threshold,
+            "picture_description_local": cfg.picture_description_local,
+            "picture_description_api": cfg.picture_description_api,
+            "vlm_pipeline_model": cfg.vlm_pipeline_model,
+            "vlm_pipeline_model_local": cfg.vlm_pipeline_model_local,
+            "vlm_pipeline_model_api": cfg.vlm_pipeline_model_api,
         }
         options.update(overrides or {})   # caller (API) overrides win
+        _check_mutually_exclusive(options)
         return options
 
     async def parse(
@@ -86,3 +118,18 @@ class DoclingParser(BaseDocumentParser):
             text=text,
             metadata={"filename": filename, "mime_type": mime_type, "parser": "docling"},
         )
+
+
+if __name__ == "__main__":
+    _check_mutually_exclusive({"do_ocr": True})  # no conflict
+    _check_mutually_exclusive({"vlm_pipeline_model": "x"})  # one set is fine
+    for bad in (
+        {"picture_description_local": "a", "picture_description_api": "b"},
+        {"vlm_pipeline_model": "a", "vlm_pipeline_model_api": "b"},
+    ):
+        try:
+            _check_mutually_exclusive(bad)
+            raise SystemExit(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    print("OK")

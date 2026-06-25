@@ -1,8 +1,20 @@
-from typing import List
+from typing import List, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from langchain_openai import AzureOpenAIEmbeddings as _LangchainAzureEmbeddings
 
 from app.services.embeddings.base import BaseEmbeddingProvider
+
+
+def parse_azure_url(url: str) -> Tuple[str, str, str]:
+    """Split a full Azure deployment URL into (endpoint, deployment, api_version).
+    Expects: https://<res>.openai.azure.com/openai/deployments/<dep>/embeddings?api-version=<ver>"""
+    parsed = urlparse(url)
+    endpoint = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.strip("/").split("/")
+    deployment = parts[parts.index("deployments") + 1] if "deployments" in parts else ""
+    api_version = parse_qs(parsed.query).get("api-version", [""])[0]
+    return endpoint, deployment, api_version
 
 
 class AzureOpenAIEmbeddings(BaseEmbeddingProvider):

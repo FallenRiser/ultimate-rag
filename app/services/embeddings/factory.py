@@ -8,12 +8,17 @@ def create_embedding_provider() -> BaseEmbeddingProvider:
     provider = cfg.provider
 
     if provider == "azure_openai":
-        from app.services.embeddings.azure_openai import AzureOpenAIEmbeddings
+        from app.services.embeddings.azure_openai import AzureOpenAIEmbeddings, parse_azure_url
+        # A full deployment URL (env RAG_EMBEDDINGS__AZURE_URL) takes precedence over the split fields.
+        if cfg.azure_url:
+            endpoint, deployment, api_version = parse_azure_url(cfg.azure_url)
+        else:
+            endpoint, deployment, api_version = cfg.azure_endpoint or "", cfg.azure_deployment or cfg.model, cfg.api_version
         return AzureOpenAIEmbeddings(
             api_key=cfg.api_key or "",
-            endpoint=cfg.azure_endpoint or "",
-            deployment=cfg.azure_deployment or cfg.model,
-            api_version=cfg.api_version,
+            endpoint=endpoint,
+            deployment=deployment,
+            api_version=api_version,
             dim=cfg.dim,
         )
 
