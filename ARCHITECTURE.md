@@ -25,7 +25,7 @@ so swapping a vector DB / LLM / embedder / parser / cache is a one-file change.
 | Observability | **MLflow Tracing** (autolog + manual spans) + **Rich** logging | Self-hosted; DEBUG = full untruncated traces. |
 | Ingestion | **In-process** — FastAPI background task (`POST /ingest`) or inline (`POST /ingest/sync`) | No broker/worker to operate; bytes processed in-memory. |
 | Metadata | Structured columns + JSONB; optional LLM extraction at ingest; filterable at query | Highest-ROI enterprise feature. |
-| Structured output | **instructor** + Pydantic models, auto-retry on validation fail | Matches requirement to parse LLM outputs with Pydantic. |
+| Structured output | LangChain **`with_structured_output`** + Pydantic models | LLM outputs parsed/validated into Pydantic schemas. |
 | Rerankers | `Reranker` ABC → BGE-reranker-v2-m3 (default, via TEI), Qwen3 / Cohere optional | BGE = lightweight safe default. |
 | Chat memory | LangGraph Postgres checkpointer + session store | Per-session memory. |
 | User isolation | `user_id` enforced as a mandatory filter at the **repository** layer | Never trusted from the caller. |

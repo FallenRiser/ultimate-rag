@@ -21,13 +21,10 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0",
     "langgraph-checkpoint-sqlite>=2.0",   # sqlite chat memory
     "langchain-core>=0.3",
-    "langchain-openai>=0.2",              # tool-calling agent (agent.style=tools)
     "deepagents>=0.5",                    # planner + sub-agents agent (agent.style=deep)
-    # --- structured output ---
-    "instructor>=1.5",
-    # --- llm / embedding clients ---
-    "openai>=1.40",                 # OpenAI + Azure + vLLM (OpenAI-compatible)
-    "ollama>=0.3",
+    # --- llm / embedding clients (all via LangChain) ---
+    "langchain-openai>=0.2",        # OpenAI + Azure + vLLM (OpenAI-compatible)
+    "langchain-ollama>=0.2",        # local Ollama models + embeddings
     # --- vector stores ---
     "qdrant-client>=1.11",
     "fastembed>=0.3",               # BM25 / sparse vectors

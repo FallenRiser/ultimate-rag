@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, BinaryIO, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel  # noqa: F401  (re-exported for parser models)
 
 
 class PageContent(BaseModel):
@@ -19,7 +19,13 @@ class ParsedDocument(BaseModel):
 
 class BaseDocumentParser(ABC):
     @abstractmethod
-    async def parse(self, file: BinaryIO, mime_type: str, filename: str) -> ParsedDocument: ...
+    async def parse(
+        self,
+        file: BinaryIO,
+        mime_type: str,
+        filename: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> ParsedDocument: ...
 
     @abstractmethod
     def supports(self, mime_type: str) -> bool: ...

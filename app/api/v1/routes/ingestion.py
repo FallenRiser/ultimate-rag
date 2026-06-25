@@ -19,17 +19,16 @@ def _resolve_mime(file: UploadFile) -> str:
     return file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
 
 
-def _parse_metadata(metadata: Optional[str]) -> dict:
-    """Parse the optional metadata form field (a JSON object string) into a flat dict.
-    Values become filterable at query time (e.g. {"category": "finance", "year": "2024"})."""
-    if not metadata:
+def _parse_json_object(raw: Optional[str], field: str) -> dict:
+    """Parse an optional JSON-object form field into a dict (empty if absent)."""
+    if not raw:
         return {}
     try:
-        parsed = json.loads(metadata)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="metadata must be a valid JSON object")
+        raise HTTPException(status_code=400, detail=f"{field} must be a valid JSON object")
     if not isinstance(parsed, dict):
-        raise HTTPException(status_code=400, detail="metadata must be a JSON object")
+        raise HTTPException(status_code=400, detail=f"{field} must be a JSON object")
     return parsed
 
 
@@ -58,11 +57,14 @@ async def ingest_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
+    parser_options: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user),
 ) -> IngestionResponse:
     """Async ingest — registers the document and processes it in a background task.
-    `metadata` is an optional JSON object whose keys become filterable at query time."""
-    extra_metadata = _parse_metadata(metadata)
+    `metadata`: JSON object, keys become filterable at query time.
+    `parser_options`: JSON object overriding docling-serve settings for this document."""
+    extra_metadata = _parse_json_object(metadata, "metadata")
+    options = _parse_json_object(parser_options, "parser_options")
     service, doc, dedup, content, mime_type = await _read_and_register(file, user_id)
     if dedup:
         return dedup
@@ -76,6 +78,7 @@ async def ingest_document(
         mime_type=mime_type,
         content_hash=sha256_bytes(content),
         extra_metadata=extra_metadata,
+        parser_options=options,
     )
     return IngestionResponse(document_id=doc.id, task_id=doc.id, status="queued")
 
@@ -84,11 +87,14 @@ async def ingest_document(
 async def ingest_document_sync(
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
+    parser_options: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user),
 ) -> IngestionResponse:
     """Sync ingest — runs the full pipeline inline and returns the final status.
-    `metadata` is an optional JSON object whose keys become filterable at query time."""
-    extra_metadata = _parse_metadata(metadata)
+    `metadata`: JSON object, keys become filterable at query time.
+    `parser_options`: JSON object overriding docling-serve settings for this document."""
+    extra_metadata = _parse_json_object(metadata, "metadata")
+    options = _parse_json_object(parser_options, "parser_options")
     service, doc, dedup, content, mime_type = await _read_and_register(file, user_id)
     if dedup:
         return dedup
@@ -101,6 +107,7 @@ async def ingest_document_sync(
         mime_type=mime_type,
         content_hash=sha256_bytes(content),
         extra_metadata=extra_metadata,
+        parser_options=options,
     )
     return IngestionResponse(document_id=doc.id, task_id="sync", status=status.value)
 

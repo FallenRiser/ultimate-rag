@@ -141,7 +141,6 @@ class LLMSettings(BaseModel):
     max_tokens: int = 1024
     timeout_s: int = 60
     max_retries: int = 3
-    structured_output: str = "instructor"
 
 
 class RerankerSettings(BaseModel):
@@ -154,8 +153,19 @@ class RerankerSettings(BaseModel):
 
 class DoclingSettings(BaseModel):
     url: str = "http://localhost:5001"
+    to_formats: List[str] = ["md"]              # md | json | html | text | doctags
+    from_formats: Optional[List[str]] = None    # None = all (pdf, docx, pptx, xlsx, html, image, …)
     do_ocr: bool = True
+    force_ocr: bool = False
+    ocr_engine: str = "easyocr"                 # easyocr | tesseract | rapidocr | …
+    ocr_lang: Optional[List[str]] = None        # e.g. ["en"]; None = engine default
+    pdf_backend: str = "dlparse_v2"             # dlparse_v2 | dlparse_v1 | pypdfium2
+    table_mode: str = "fast"                    # fast | accurate
     do_table_structure: bool = True
+    image_export_mode: str = "placeholder"      # placeholder | embedded | referenced
+    abort_on_error: bool = False
+    return_as_file: bool = False
+    document_timeout: Optional[float] = None    # max seconds per document (None = server default)
 
 
 class CustomParsingSettings(BaseModel):

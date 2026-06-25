@@ -1,7 +1,7 @@
 import asyncio
 import csv
 import io
-from typing import BinaryIO, List
+from typing import Any, BinaryIO, Dict, List, Optional
 
 from app.services.parsing.base import BaseDocumentParser, PageContent, ParsedDocument
 
@@ -23,7 +23,14 @@ class CustomParser(BaseDocumentParser):
     def supports(self, mime_type: str) -> bool:
         return mime_type in _SUPPORTED
 
-    async def parse(self, file: BinaryIO, mime_type: str, filename: str) -> ParsedDocument:
+    async def parse(
+        self,
+        file: BinaryIO,
+        mime_type: str,
+        filename: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> ParsedDocument:
+        # options apply to docling-serve only; the custom parser ignores them.
         return await asyncio.to_thread(self._parse_sync, file, mime_type, filename)
 
     def _parse_sync(self, file: BinaryIO, mime_type: str, filename: str) -> ParsedDocument:

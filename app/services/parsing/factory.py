@@ -8,8 +8,7 @@ def create_parser() -> BaseDocumentParser:
 
     if backend == "docling":
         from app.services.parsing.docling_client import DoclingParser
-        cfg = settings.parsing.docling
-        return DoclingParser(url=cfg.url, do_ocr=cfg.do_ocr, do_table_structure=cfg.do_table_structure)
+        return DoclingParser(settings=settings.parsing.docling)
 
     if backend == "custom":
         from app.services.parsing.custom_parser import CustomParser

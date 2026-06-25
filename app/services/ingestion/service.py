@@ -65,6 +65,7 @@ class IngestionService:
         mime_type: str,
         content_hash: str,
         extra_metadata: Optional[dict] = None,
+        parser_options: Optional[dict] = None,
     ) -> DocumentStatus:
         """Full pipeline: parse → chunk → embed → upsert vector DB. Returns final status."""
         engine = get_engine()
@@ -79,7 +80,7 @@ class IngestionService:
             settings = get_settings()
 
             logger.info("Parsing %s (%s)", filename, mime_type)
-            parsed = await parser.parse(io.BytesIO(content), mime_type, filename)
+            parsed = await parser.parse(io.BytesIO(content), mime_type, filename, options=parser_options)
             logger.debug("Parsed %s: %d chars, %d pages", filename, len(parsed.text), len(parsed.pages))
 
             version = DocumentVersion(

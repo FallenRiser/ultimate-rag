@@ -111,7 +111,6 @@ llm:
   max_tokens: 1024
   timeout_s: 60
   max_retries: 3
-  structured_output: "instructor"    # instructor | native_tools
 
 # --- Reranker ---------------------------------------------------------------
 reranker:
@@ -124,10 +123,21 @@ reranker:
 # --- Document parsing -------------------------------------------------------
 parsing:
   backend: "custom"                  # docling | custom
-  docling:
+  docling:                           # any of these can be overridden per-request via parser_options
     url: "http://localhost:5001"     # docling-serve
+    to_formats: ["md"]               # md | json | html | text | doctags
+    from_formats: null               # null = all input formats
     do_ocr: true
+    force_ocr: false
+    ocr_engine: "easyocr"            # easyocr | tesseract | rapidocr
+    ocr_lang: null                   # e.g. ["en"]; null = engine default
+    pdf_backend: "dlparse_v2"        # dlparse_v2 | dlparse_v1 | pypdfium2
+    table_mode: "fast"               # fast | accurate
     do_table_structure: true
+    image_export_mode: "placeholder" # placeholder | embedded | referenced
+    abort_on_error: false
+    return_as_file: false
+    document_timeout: null           # max seconds per document (null = server default)
   custom:
     ocr_engine: "rapidocr"           # rapidocr | tesseract
     ocr_languages: ["en"]
