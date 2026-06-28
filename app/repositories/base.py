@@ -52,21 +52,76 @@ class BaseVectorDB(ABC):
 
 
 class BaseGraphStore(ABC):
-    """Abstract base for graph stores (Apache AGE / Memgraph)."""
+    """Abstract base for graph stores (Apache AGE on Postgres / NetworkX local files).
+
+    Entities merge across a tenant's documents by normalized name; each carries a description
+    and (optionally) an embedding for semantic matching. Relations are edges. Communities are
+    LLM-summarised clusters used for global/thematic retrieval."""
+
+    # --- writes (ingest) ----------------------------------------------------
+    @abstractmethod
+    async def upsert_entities(self, entities: List[Dict[str, Any]], user_id: str) -> None:
+        """Batch upsert. Each entity: {id, name, type, description, embedding, document_id, chunk_id}.
+        Merges chunk mentions and descriptions onto the existing node (cross-document)."""
+        ...
 
     @abstractmethod
-    async def upsert_entity(self, entity: Dict[str, Any], user_id: str) -> None: ...
+    async def upsert_relations(self, relations: List[Dict[str, Any]], user_id: str) -> None:
+        """Batch upsert. Each relation: {source_id, target_id, relation_type, description, document_id}."""
+        ...
 
     @abstractmethod
-    async def upsert_relation(self, relation: Dict[str, Any], user_id: str) -> None: ...
+    async def update_entity_descriptions(self, descriptions: Dict[str, str], user_id: str) -> None:
+        """Overwrite the description of specific entities (used after LLM merge-summarisation)."""
+        ...
 
     @abstractmethod
-    async def query(self, cypher: str, params: Dict[str, Any]) -> List[Dict[str, Any]]: ...
+    async def save_communities(self, communities: List[Dict[str, Any]], user_id: str) -> None:
+        """Replace the tenant's community reports. Each: {id, title, summary, members, embedding}."""
+        ...
+
+    # --- reads (retrieve / community build) ---------------------------------
+    @abstractmethod
+    async def search_entities(
+        self, query_vector: List[float], user_id: str, top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Semantic seed selection: entities ranked by embedding cosine. [{id, name, score}]."""
+        ...
 
     @abstractmethod
-    async def find_chunks_for_entities(
-        self, entity_names: List[str], user_id: str
-    ) -> List[str]: ...
+    async def match_entities_by_name(
+        self, names: List[str], user_id: str
+    ) -> List[Dict[str, Any]]:
+        """String fallback seed selection (partial, case-insensitive). [{id, name, score}]."""
+        ...
+
+    @abstractmethod
+    async def expand_and_collect(
+        self, seed_ids: List[str], user_id: str, hops: int
+    ) -> List[str]:
+        """Traverse `hops` relation-edges from the seeds and return their chunk_ids, ranked
+        seeds-first then by hop distance (hops=0 = seeds only)."""
+        ...
+
+    @abstractmethod
+    async def load_graph_data(self, user_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Whole tenant graph for clustering/summarisation:
+        {"entities": [{id, name, type, description}], "relations": [{source, target, type, description}]}."""
+        ...
+
+    @abstractmethod
+    async def search_communities(
+        self, query_vector: List[float], user_id: str, top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Global/thematic retrieval: community reports ranked by cosine. [{id, title, summary, score}]."""
+        ...
+
+    @abstractmethod
+    async def communities_for_entities(
+        self, seed_ids: List[str], user_id: str
+    ) -> List[Dict[str, Any]]:
+        """High-level dual-level signal: community reports containing any seed entity."""
+        ...
 
     @abstractmethod
     async def delete_by_document(self, document_id: str, user_id: str) -> None: ...

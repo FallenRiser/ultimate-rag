@@ -47,12 +47,16 @@ async def get_session(engine: AsyncEngine, session_id: str, user_id: str) -> Opt
     )
 
 
-async def list_sessions(engine: AsyncEngine, user_id: str) -> List[ChatSession]:
+async def list_sessions(
+    engine: AsyncEngine, user_id: str, limit: int = 20, offset: int = 0
+) -> List[ChatSession]:
     async with engine.connect() as conn:
         result = await conn.execute(text("""
             SELECT id, user_id, title, created_at, last_active_at
-            FROM chat_sessions WHERE user_id = :user_id ORDER BY last_active_at DESC
-        """), {"user_id": user_id})
+            FROM chat_sessions WHERE user_id = :user_id
+            ORDER BY last_active_at DESC
+            LIMIT :limit OFFSET :offset
+        """), {"user_id": user_id, "limit": limit, "offset": offset})
         rows = result.fetchall()
     return [
         ChatSession(
@@ -63,8 +67,21 @@ async def list_sessions(engine: AsyncEngine, user_id: str) -> List[ChatSession]:
     ]
 
 
+async def count_sessions(engine: AsyncEngine, user_id: str) -> int:
+    async with engine.connect() as conn:
+        result = await conn.execute(text(
+            "SELECT COUNT(*) AS n FROM chat_sessions WHERE user_id = :user_id"
+        ), {"user_id": user_id})
+        return result.fetchone().n
+
+
 async def delete_session(engine: AsyncEngine, session_id: str, user_id: str) -> bool:
+    """Delete the session and its messages in one transaction. chat_messages has no portable
+    FK cascade (SQLite needs PRAGMA foreign_keys=ON), so we remove them explicitly."""
     async with engine.begin() as conn:
+        await conn.execute(text("""
+            DELETE FROM chat_messages WHERE session_id = :id AND user_id = :user_id
+        """), {"id": session_id, "user_id": user_id})
         result = await conn.execute(text("""
             DELETE FROM chat_sessions WHERE id = :id AND user_id = :user_id
         """), {"id": session_id, "user_id": user_id})

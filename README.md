@@ -1,50 +1,92 @@
 # Ultimate RAG
 
-Enterprise-grade, **agentic**, multi-retrieval RAG platform.
+Enterprise-grade, **agentic**, multi-retrieval RAG platform with a real **GraphRAG**
+knowledge graph. Every external dependency sits behind a small abstract base class
+selected in `config/config.yaml`, so swapping a vector DB / graph store / LLM / embedder /
+parser / reranker / cache is a one-file change.
 
-- **Agentic** query analysis, rewrite/decompose, multi-retrieval, grading loop (LangGraph)
-- **Retrieval modes:** semantic · BM25 · graph · hybrid · hybrid+graph
-- **Pluggable everything** — vector DB, graph DB, LLM, embeddings, parser, chunker, reranker, cache all behind a base class + config
-- **Providers today:** pgvector + Qdrant + Chroma · Azure OpenAI + OpenAI + Ollama embeddings · OpenAI/vLLM/Ollama LLMs · Docling + custom parsing · BGE reranker · Apache Ignite cache
+- **Agentic** query analysis, rewrite/decompose, multi-retrieval, relevance grading loop (LangGraph)
+- **Retrieval modes:** `semantic` · `bm25` · `graph` · `hybrid` · `hybrid_graph` · `graph_global`
+- **GraphRAG (local + global):** entity + relation extraction with descriptions, **cross-document
+  entity merging**, **semantic entity matching** (embedded entities, not string match),
+  **multi-hop traversal**, **community detection + LLM reports** (thematic/global queries), and
+  **dual-level** retrieval (entity chunks blended with community context)
+- **Pluggable everything** — vector store, graph store, LLM, embeddings, parser, chunker, reranker,
+  cache, relational DB, all behind a base class + a one-function factory keyed on config
+- **Providers today:**
+  - Vector: **pgvector** (semantic) · **Chroma** (semantic) · **Qdrant** (semantic + BM25)
+  - Graph: **NetworkX** (local JSON files, zero-infra default) · **Apache AGE** (Postgres)
+  - Embeddings: Azure OpenAI · OpenAI · Ollama   ·   LLM: OpenAI · vLLM · Ollama (all OpenAI-compatible)
+  - Parsing: Docling-serve · custom (pypdf/python-docx/python-pptx/openpyxl/OCR)
+  - Reranker: BGE (Qwen3/Cohere optional)   ·   Cache: Apache Ignite
 - **Relational:** Postgres or SQLite (config-selected)
-- **Enterprise:** per-user document isolation (`X-User-Id` header), document versioning, metadata filtering, citations w/ confidence, chat sessions w/ memory
-- **Ops:** in-process ingestion (background task or `POST /ingest/sync`), MLflow tracing, Rich logging, Pydantic everywhere
+- **Capability-aware:** the active vector store decides which modes exist (BM25/hybrid rejected on
+  semantic-only stores — no FTS fake-out); graph modes require a graph store
+- **Enterprise:** per-user (tenant) isolation enforced at the repository layer, document versioning,
+  LLM metadata extraction + auto-filtering, citations with confidence, chat sessions with memory
+- **Ops:** in-process ingestion (background task or `POST /ingest/sync`), MLflow tracing, Rich logging,
+  Pydantic at every boundary
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and phased roadmap.
-
-> **Status:** Phase 0 — skeleton. Folder structure, base classes, config schema, and
-> Pydantic models are in place. Concrete implementations are stubs (`NotImplementedError`).
+**Docs:** **[CONFIG_AND_API.md](CONFIG_AND_API.md)** — when to use which config + what every endpoint does ·
+**[PROJECT_GUIDE.md](PROJECT_GUIDE.md)** — layer-by-layer design, file map, how to add a provider, coding
+standards · [ARCHITECTURE.md](ARCHITECTURE.md) — original design decisions and roadmap.
 
 ## Layout
 ```
 app/
-  api/v1/routes/   HTTP routes (thin)
-  services/        business logic (embeddings, llm, parsing, chunking, reranking,
-                   retrieval, ingestion, agent, citation)
-  repositories/    DB connections (vector, graph, cache, relational)
-  models/          Pydantic models
-  observability/   logging (Rich) + tracing (MLflow)
-  utils/           config loader, registry, helpers
-config/config.yaml  runtime configuration
-logs/               Rich file logs
+  api/v1/routes/   thin HTTP routes (health, documents, ingestion, query, chat)
+  services/        business logic: embeddings, llm, parsing, chunking, reranking,
+                   retrieval, ingestion, graph (GraphRAG build), agent, citation
+  repositories/    infrastructure access: vector, graph, cache, relational, storage
+  models/          Pydantic models (validation/serialization at boundaries)
+  prompts/         all LLM prompts (ingestion, retrieval, agent)
+  observability/   logging (Rich) + tracing (MLflow) + timing
+  utils/           config loader, hashing, text helpers
+config/config.yaml  single source of runtime configuration
+logs/               Rich rotating file logs
 ```
 
 ## Quickstart (dev)
 ```bash
-python -m venv .venv && source .venv/Scripts/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv && .venv\Scripts\activate          # bash: source .venv/Scripts/activate
 pip install -e ".[parsing,dev]"
-cp .env.example .env                                    # set OPENAI_API_KEY (+ OPENAI_BASE_URL)
-uvicorn app.main:app --reload
+cp .env.example .env                                    # only needed for openai providers
+uvicorn app.main:app --reload                           # http://localhost:8000/docs
 ```
 
-Ingestion runs in-process — no separate worker or Redis. The async `POST /ingest`
-returns immediately and processes in a FastAPI background task; `POST /ingest/sync`
-runs the pipeline inline and returns the final status.
+**Zero-infra stack (no Docker, no external services):** set these in `config/config.yaml` and use
+local Ollama for the LLM + embeddings —
 
-**Zero-infra setup:** set `database.provider: sqlite` and `vector_store.provider: chroma`
-in `config/config.yaml` to run with no external services (semantic retrieval only).
+```yaml
+database:      { provider: sqlite }
+vector_store:  { provider: chroma }      # semantic only (no BM25)
+graph_store:   { provider: networkx }    # local JSON files
+```
 
-Configuration is driven by `config/config.yaml`. The only env secrets are
-`OPENAI_API_KEY` / `OPENAI_BASE_URL`, used only when an `openai` provider is selected.
-There is no auth layer: callers pass an `X-User-Id` header and every repository
-filters on it for tenant isolation (absent → `default`).
+This runs the full pipeline — including GraphRAG — entirely on local files. Use `qdrant` if you want
+BM25/hybrid, and `postgres` + `age` if you want everything in one ACID database.
+
+## API (prefix `/api/v1`)
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | liveness |
+| `POST` | `/ingest` | ingest (background task), returns immediately |
+| `POST` | `/ingest/sync` | ingest inline, returns final status |
+| `POST` | `/ingest/upload` · `/ingest/by-filename` · `/ingest/bytes` | file/bytes ingestion variants |
+| `GET` | `/ingest/status/{document_id}` | ingestion status |
+| `GET` | `/documents` · `/documents/{id}` · `/documents/{id}/chunks` | list / get / chunks |
+| `DELETE` | `/documents/{id}` | delete a document (cascades chunks + graph) |
+| `POST` | `/documents/graph/rebuild-communities` | rebuild GraphRAG community reports (global/thematic mode) |
+| `POST` | `/query` | one-shot RAG query (optionally agentic) |
+| `POST` | `/chat` | chat turn with session memory |
+| `GET` | `/chat/sessions` · `/chat/sessions/{id}/messages` | paginated sessions / messages |
+| `DELETE` | `/chat/sessions/{id}` | delete a session (cascades messages) |
+
+## Tenancy & secrets
+There is **no auth layer**. Callers pass `user_id` **in the request payload** (JSON body field,
+multipart form field, or query param); every repository read/write filters on it for tenant
+isolation. Absent → `"default"`. Put a gateway/IdP in front for production.
+
+Configuration lives in `config/config.yaml`. The only env secrets are `OPENAI_API_KEY` /
+`OPENAI_BASE_URL` (used only when an `openai`/`azure_openai` provider is selected) and the Postgres
+DSN; env overrides YAML (prefix `RAG_`, nested keys via `__`, e.g. `RAG_LLM__API_KEY`).

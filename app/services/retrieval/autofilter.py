@@ -1,44 +1,71 @@
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
-from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.models.agent import InferredFilters
+from app.models.ingestion import MetadataKey
+from app.prompts.retrieval import allowed_keys_prompt, auto_filter_system
+from app.repositories.relational.metadata_catalog import get_catalog
 from app.services.llm.base import BaseLLMProvider
+from app.utils.config import AutoFilterSettings
 
 logger = logging.getLogger(__name__)
 
 
-class _InferredFilters(BaseModel):
-    filters: Dict[str, str] = Field(default_factory=dict)
+async def infer_filters(
+    llm: BaseLLMProvider,
+    query: str,
+    user_id: str,
+    engine: AsyncEngine,
+    settings: AutoFilterSettings,
+) -> Dict[str, Any]:
+    """Pull exact-match metadata filters out of the query — only for allowed keys (core fields
+    plus this tenant's discovered attribute keys), and only when the query clearly constrains
+    them. A key with several allowed values becomes a list (OR-matched). Returns {} on doubt or
+    error; callers apply softly (fall back to no filters)."""
+    # Non-breaking: a catalog failure must not break querying — fall back to core fields only.
+    catalog: List[MetadataKey] = []
+    if settings.use_catalog:
+        try:
+            catalog = (await get_catalog(engine, user_id))[: settings.max_catalog_keys]
+        except SQLAlchemyError as exc:
+            logger.warning("Catalog read failed for %s; auto-filter using core fields only: %s", user_id, exc)
+            logger.debug("Catalog read DB failure (user=%s)", user_id, exc_info=True)
+        except Exception as exc:
+            logger.warning("Unexpected error reading catalog for %s; using core fields only: %s", user_id, exc)
+            logger.debug("Unexpected catalog read failure (user=%s)", user_id, exc_info=True)
 
-
-async def infer_filters(llm: BaseLLMProvider, query: str, fields: List[str]) -> Dict[str, str]:
-    """Ask the LLM to pull metadata filters out of the query — but only for the allowed
-    `fields`, and only when the query clearly constrains them. Returns {} on any doubt or
-    error. Callers apply these softly (fall back to no filters if the result is empty)."""
-    if not fields:
+    allowed = set(settings.fields) | {entry.key for entry in catalog}
+    if not allowed:
         return {}
+    logger.debug("Auto-filter allowed keys for %s: %s", user_id, sorted(allowed))
 
-    field_list = ", ".join(fields)
+    # Non-breaking: if filter inference fails, return no filters (callers fall back to semantic).
     try:
-        result: _InferredFilters = await llm.structured_output(
+        result: InferredFilters = await llm.structured_output(
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        f"Extract metadata filters from the user's question, ONLY for these fields: "
-                        f"{field_list}. Include a field only when the question explicitly and "
-                        "unambiguously constrains it (e.g. 'in the 10-Q filing' -> doc_type). "
-                        "Never guess. Return an empty object if nothing clearly applies."
-                    ),
+                    "content": auto_filter_system(allowed_keys_prompt(settings.fields, catalog)),
                 },
                 {"role": "user", "content": query},
             ],
-            schema=_InferredFilters,
+            schema=InferredFilters,
         )
     except Exception as exc:
-        logger.warning("Auto-filter inference failed: %s", exc)
+        logger.warning("Auto-filter inference failed; proceeding without filters: %s", exc)
+        logger.debug("Auto-filter inference failure (user=%s, query=%r)", user_id, query, exc_info=True)
         return {}
 
-    # Keep only allowed, non-empty fields — guards against hallucinated keys.
-    return {k: v for k, v in result.filters.items() if k in fields and v}
+    # Keep allowed keys only; normalize values to match how they're stored (lowercased).
+    # A single value stays scalar; several become a list (OR-matched by the vector store).
+    filters: Dict[str, Any] = {}
+    for cond in result.conditions:
+        key = cond.key.strip().lower()
+        values = [v.strip().lower() for v in cond.values if v and v.strip()]
+        if key in allowed and values:
+            filters[key] = values[0] if len(values) == 1 else values
+    logger.debug("Auto-filter inferred %d filter(s) from query: %s", len(filters), filters)
+    return filters

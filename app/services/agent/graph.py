@@ -16,59 +16,19 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from pydantic import BaseModel, Field
-
+from app.models.agent import AgentState, QueryAnalysis, RelevanceGrade, StandaloneQuery
+from app.observability.tracing import log_chunks_to_trace, request_trace
+from app.prompts.agent import ANALYZE_SYSTEM, CONTEXTUALIZE_SYSTEM, GRADE_SYSTEM, SYNTHESIZE_SYSTEM
 from app.repositories.base import BaseVectorDB
 from app.services.citation.builder import build_citation
 from app.services.embeddings.base import BaseEmbeddingProvider
 from app.services.llm.base import BaseLLMProvider
 from app.services.reranking.base import BaseReranker
-from app.services.retrieval.service import RetrievalService, _rrf_fuse
+from app.services.retrieval.service import _VALID_MODES, RetrievalService, _rrf_fuse
 from app.utils.config import get_settings
+from app.utils.text import cap_list
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-class AgentState(BaseModel):
-    query: str
-    user_id: str
-    session_id: Optional[str] = None
-    mode: Optional[str] = None
-    filters: Dict[str, Any] = Field(default_factory=dict)
-    history: List[Dict[str, str]] = Field(default_factory=list)  # prior {role, content} turns
-    context: str = ""                                            # snippets from exploratory retrieval
-    app_timings: Dict[str, float] = Field(default_factory=dict)  # per-node milliseconds
-    subqueries: List[str] = Field(default_factory=list)
-    retrieved_chunks: List[Dict[str, Any]] = Field(default_factory=list)
-    reranked_chunks: List[Dict[str, Any]] = Field(default_factory=list)
-    answer: Optional[str] = None
-    citations: List[Dict[str, Any]] = Field(default_factory=list)
-    loop_count: int = 0
-    grade_passed: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Structured output schemas (used by LLM nodes)
-# ---------------------------------------------------------------------------
-
-class QueryAnalysis(BaseModel):
-    needs_decomposition: bool = False
-    subqueries: List[str] = Field(default_factory=list)
-    suggested_mode: str = "hybrid"
-    rewritten_query: Optional[str] = None
-
-
-class RelevanceGrade(BaseModel):
-    is_relevant: bool = True
-    reason: str = ""
-
-
-class StandaloneQuery(BaseModel):
-    query: str
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +56,12 @@ def _get_services() -> _AgentServices:
         from app.services.reranking.factory import create_reranker
 
         settings = get_settings()
+        llm = create_llm_provider()
         _services = _AgentServices(
-            retrieval=RetrievalService(create_vector_db(), graph_store=create_graph_store()),
+            retrieval=RetrievalService(create_vector_db(), graph_store=create_graph_store(), llm_provider=llm),
             embedding=create_embedding_provider(),
             reranker=create_reranker() if settings.reranker.enabled else None,
-            llm=create_llm_provider(),
+            llm=llm,
         )
     return _services
 
@@ -118,18 +79,11 @@ def _node(stage: str) -> Callable:
             start = time.perf_counter()
             update = await fn(state)
             elapsed_ms = round((time.perf_counter() - start) * 1000.0, 1)
-            return {**update, "app_timings": {**state.app_timings, stage: elapsed_ms}}
+            # Accumulate so a looped node's time is summed across iterations, not overwritten.
+            prior = state.app_timings.get(stage, 0.0)
+            return {**update, "app_timings": {**state.app_timings, stage: round(prior + elapsed_ms, 1)}}
         return wrapper
     return decorator
-
-_CONTEXTUALIZE_SYSTEM = (
-    "You rewrite a user's new question into a self-contained question. "
-    "Resolve references such as 'it', 'that', 'they', 'this', or an omitted subject using the "
-    "conversation — but ONLY when the new question clearly depends on earlier turns. "
-    "If the new question is already self-contained, or introduces a new topic or document, "
-    "return it unchanged. Never add facts, names, or constraints the user did not state."
-)
-
 
 def _format_history(history: List[Dict[str, str]]) -> str:
     lines: List[str] = []
@@ -159,7 +113,7 @@ async def contextualize(state: AgentState) -> dict:
     try:
         result: StandaloneQuery = await svc.llm.structured_output(
             messages=[
-                {"role": "system", "content": _CONTEXTUALIZE_SYSTEM},
+                {"role": "system", "content": CONTEXTUALIZE_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
             schema=StandaloneQuery,
@@ -190,92 +144,106 @@ async def explore_context(state: AgentState) -> dict:
     # Always semantic here — independent of the requested mode (which may need graph/sparse).
     chunks = await svc.retrieval.vector_db.dense_search(query_vector, state.user_id, top_k)
 
-    snippets = [c.get("payload", {}).get("text", "")[:300] for c in chunks]
+    snippets = [c.get("payload", {}).get("text", "") for c in chunks]
     context = "\n---\n".join(s for s in snippets if s)
     logger.debug("Exploration retrieved %d snippets for grounding", len(snippets))
     return {"context": context}
 
 
-_ANALYZE_SYSTEM = (
-    "Analyze the user query. Determine if it needs decomposition into simpler subqueries. "
-    "If it can be answered directly, set needs_decomposition=false and leave subqueries empty. "
-    "Suggest a retrieval mode: 'semantic' for factual lookups, 'hybrid' for exploratory queries. "
-    "If context from the knowledge base is provided, use it to ground your rewrite and to fill in "
-    "implied subjects the user left out (e.g. which company or metric). Never invent facts."
-)
-
-
 @_node("query_analysis")
 async def analyze_query(state: AgentState) -> dict:
-    """LLM decides if query needs rewriting, decomposition, which retrieval mode, and
-    (optionally) infers metadata filters from the query."""
+    """LLM decides if the query needs rewriting/decomposition and which retrieval mode, and
+    (optionally) infers metadata filters. Filter inference and the analysis call are
+    independent, so they run concurrently. Explicit (request) filters win over inferred ones."""
     settings = get_settings()
     svc = _get_services()
-
-    # Agentic auto-filter (independent of rewrite/decompose). Explicit filters win.
-    filter_update = {}
     auto = settings.agent.auto_filter
-    if auto.enabled:
-        from app.services.retrieval.autofilter import infer_filters
-        inferred = await infer_filters(svc.llm, state.query, auto.fields)
-        if inferred:
-            filter_update = {"filters": {**inferred, **state.filters}}
+    do_analysis = settings.agent.query_rewrite or settings.agent.decompose
 
-    if not settings.agent.query_rewrite and not settings.agent.decompose:
-        mode = state.mode or settings.retrieval.default_mode
-        return {"mode": mode, "subqueries": [state.query], **filter_update}
+    explicit_filters = dict(state.filters)   # request filters, before inferred ones are merged
 
     if state.context:
         user_content = f"Context from the knowledge base:\n{state.context}\n\nUser query: {state.query}"
     else:
         user_content = state.query
 
-    try:
-        analysis: QueryAnalysis = await svc.llm.structured_output(
-            messages=[
-                {"role": "system", "content": _ANALYZE_SYSTEM},
-                {"role": "user", "content": user_content},
-            ],
-            schema=QueryAnalysis,
-        )
-    except Exception as exc:
-        logger.warning("Query analysis LLM call failed: %s", exc)
-        return {"mode": state.mode or settings.retrieval.default_mode, "subqueries": [state.query]}
+    async def _infer() -> dict:
+        if not auto.enabled:
+            return {}
+        from app.repositories.relational.database import get_engine
+        from app.services.retrieval.autofilter import infer_filters
+        return await infer_filters(svc.llm, state.query, state.user_id, get_engine(), auto)
 
-    mode = state.mode or analysis.suggested_mode or settings.retrieval.default_mode
+    async def _analyze() -> Optional[QueryAnalysis]:
+        if not do_analysis:
+            return None
+        try:
+            return await svc.llm.structured_output(
+                messages=[
+                    {"role": "system", "content": ANALYZE_SYSTEM},
+                    {"role": "user", "content": user_content},
+                ],
+                schema=QueryAnalysis,
+            )
+        except Exception as exc:
+            logger.warning("Query analysis LLM call failed; using defaults: %s", exc)
+            logger.debug("Query analysis failure (query=%r)", state.query, exc_info=True)
+            return None
+
+    inferred, analysis = await asyncio.gather(_infer(), _analyze())
+
+    filter_update = {"filters": {**inferred, **state.filters}} if inferred else {}
+
+    if analysis is None:
+        mode = state.mode or settings.retrieval.default_mode
+        return {"mode": mode, "subqueries": [state.query], "explicit_filters": explicit_filters, **filter_update}
+
+    # Clamp the LLM's suggested mode to a real mode; the retrieve node still guards against a
+    # valid-but-store-incompatible mode (e.g. hybrid on a semantic-only store).
+    suggested = analysis.suggested_mode if analysis.suggested_mode in _VALID_MODES else None
+    mode = state.mode or suggested or settings.retrieval.default_mode
     rewritten = analysis.rewritten_query or state.query
     subqueries = analysis.subqueries if (analysis.needs_decomposition and analysis.subqueries) else [rewritten]
-
     return {
         "query": rewritten,
         "mode": mode,
         "subqueries": subqueries[: settings.agent.max_subqueries],
+        "explicit_filters": explicit_filters,
         **filter_update,
     }
 
 
 @_node("retrieval")
 async def retrieve(state: AgentState) -> dict:
-    """Retrieves chunks for each subquery in parallel, then RRF-fuses the lists."""
+    """Retrieves chunks for each subquery in parallel, then RRF-fuses the lists. Guards against an
+    unavailable mode, and broadens the search on a corrective (graded-irrelevant) retry."""
     svc = _get_services()
     settings = get_settings()
-    mode = state.mode or settings.retrieval.default_mode
     top_k = settings.retrieval.top_k
+    is_retry = state.loop_count > 0
 
-    async def _retrieve_one(subquery: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if is_retry:
+        # The grade failed last time; re-running the same query reproduces the same chunks. Broaden:
+        # drop inferred filters (keep explicit), widen top_k, and use semantic (always available).
+        mode = "semantic"
+        filters = state.explicit_filters
+        top_k *= 2
+        logger.info("Corrective retry %d: broadening to semantic, top_k=%d, explicit filters=%s",
+                    state.loop_count, top_k, filters)
+    else:
+        mode = state.mode or settings.retrieval.default_mode
+        filters = state.filters
+
+    async def _retrieve_one(subquery: str, mode: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         query_vector = await svc.embedding.embed_query(subquery)
         return await svc.retrieval.retrieve(
-            query=subquery,
-            query_vector=query_vector,
-            user_id=state.user_id,
-            mode=mode,
-            top_k=top_k,
-            filters=filters,
+            query=subquery, query_vector=query_vector, user_id=state.user_id,
+            mode=mode, top_k=top_k, filters=filters,
         )
 
-    async def _retrieve_all(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def _retrieve_all(mode: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         subqueries = state.subqueries or [state.query]
-        all_results = await asyncio.gather(*[_retrieve_one(q, filters) for q in subqueries])
+        all_results = await asyncio.gather(*[_retrieve_one(q, mode, filters) for q in subqueries])
         if len(all_results) == 1:
             return all_results[0]
         fused = all_results[0]
@@ -283,14 +251,26 @@ async def retrieve(state: AgentState) -> dict:
             fused = _rrf_fuse(fused, result_list, top_k)
         return fused
 
-    chunks = await _retrieve_all(state.filters)
+    # Mode safety: the chosen mode may be LLM-suggested or incompatible with the active store
+    # (e.g. hybrid on a semantic-only store, a graph mode with no graph store). Degrade to
+    # semantic instead of rejecting a valid query.
+    try:
+        chunks = await _retrieve_all(mode, filters)
+    except (ValueError, NotImplementedError) as exc:
+        logger.warning("Retrieval mode %r unavailable (%s); falling back to semantic", mode, exc)
+        logger.debug("Mode fallback (query=%r)", state.query, exc_info=True)
+        mode = "semantic"
+        chunks = await _retrieve_all(mode, filters)
 
-    # Soft fallback: never let filters zero out the result set.
-    if not chunks and state.filters:
-        logger.info("Filters %s returned nothing; retrying without filters", state.filters)
-        chunks = await _retrieve_all({})
+    # Soft fallback (first pass only — the retry path already uses explicit filters): if filters
+    # zero out results, drop the INFERRED filters and retry with the user's explicit filters.
+    if not chunks and not is_retry and state.filters and state.explicit_filters != state.filters:
+        logger.info("Filters %s returned nothing; retrying with explicit filters %s",
+                    state.filters, state.explicit_filters)
+        chunks = await _retrieve_all(mode, state.explicit_filters)
 
-    return {"retrieved_chunks": chunks}
+    # Increment so _should_loop actually bounds the grade→retrieve loop by max_retrieval_loops.
+    return {"retrieved_chunks": chunks, "loop_count": state.loop_count + 1}
 
 
 @_node("rerank")
@@ -323,20 +303,15 @@ async def grade_relevance(state: AgentState) -> dict:
     if not settings.agent.grade_relevance:
         return {"grade_passed": True}
 
+    graded = cap_list(chunks, settings.agent.grade_max_chunks)
     context = "\n\n".join(
-        c.get("payload", {}).get("text", "")[:300]
-        for c in chunks[:3]
+        c.get("payload", {}).get("text", "")
+        for c in graded
     )
     try:
         grade: RelevanceGrade = await svc.llm.structured_output(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are grading whether the retrieved context is relevant to the query. "
-                        "Set is_relevant=true if the context contains information that helps answer the query."
-                    ),
-                },
+                {"role": "system", "content": GRADE_SYSTEM},
                 {
                     "role": "user",
                     "content": f"Query: {state.query}\n\nContext:\n{context}",
@@ -362,15 +337,13 @@ async def synthesize(state: AgentState) -> dict:
         if c.get("payload", {}).get("text")
     )
 
+    # Nothing retrieved → don't spend an LLM call asking it to answer from empty context.
+    if not context.strip():
+        logger.info("No context retrieved; skipping synthesis")
+        return {"answer": "I couldn't find anything relevant in the knowledge base to answer that."}
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise, factual assistant. "
-                "Answer the question using ONLY the provided context. "
-                "If the context is insufficient, say so clearly."
-            ),
-        },
+        {"role": "system", "content": SYNTHESIZE_SYSTEM},
         {
             "role": "user",
             "content": f"Context:\n{context}\n\nQuestion: {state.query}",
@@ -403,7 +376,7 @@ def _should_loop(state: AgentState) -> str:
 # Graph assembly
 # ---------------------------------------------------------------------------
 
-def _build_graph(checkpointer=None):
+def _build_graph():
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(AgentState)
@@ -426,65 +399,79 @@ def _build_graph(checkpointer=None):
     builder.add_edge("synthesize", "cite")
     builder.add_edge("cite", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile()
 
 
-async def _get_checkpointer(session_id: Optional[str]):
-    settings = get_settings()
-    if not session_id:
-        return None, None
+_compiled_graph = None
 
-    if settings.chat.checkpointer == "memory":
-        from langgraph.checkpoint.memory import MemorySaver
-        return MemorySaver(), None
 
-    if settings.chat.checkpointer == "sqlite":
-        # Persistent, zero-infra chat memory (requires langgraph-checkpoint-sqlite).
-        try:
-            import aiosqlite
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
-            conn = await aiosqlite.connect(settings.chat.sqlite_path)
-            saver = AsyncSqliteSaver(conn)
-            await saver.setup()
-            return saver, conn
-        except Exception as exc:
-            logger.warning("SQLite checkpointer unavailable, falling back to memory: %s", exc)
-            from langgraph.checkpoint.memory import MemorySaver
-            return MemorySaver(), None
-
-    # Postgres checkpointer (requires psycopg[binary]>=3.0)
-    try:
-        import psycopg
-        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-        dsn = settings.database.dsn.replace("postgresql+asyncpg://", "postgresql://")
-        conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
-        saver = AsyncPostgresSaver(conn)
-        await saver.setup()
-        return saver, conn
-    except Exception as exc:
-        logger.warning("Postgres checkpointer unavailable, falling back to memory: %s", exc)
-        from langgraph.checkpoint.memory import MemorySaver
-        return MemorySaver(), None
+def _get_graph():
+    """Compile the agent graph once and reuse it — it's stateless (state is passed at invoke),
+    so rebuilding it per request is pure waste."""
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = _build_graph()
+    return _compiled_graph
 
 
 async def run_agent(state: AgentState) -> AgentState:
-    checkpointer, conn = await _get_checkpointer(state.session_id)
-    graph = _build_graph(checkpointer)
+    # Conversation memory comes from state.history (loaded from chat_messages and consumed by
+    # the contextualize node) — no LangGraph checkpointer, since ainvoke passes the full state
+    # each turn and the checkpoint would just be overwritten.
+    graph = _get_graph()
 
-    config = (
-        {"configurable": {"thread_id": state.session_id}}
-        if state.session_id
-        else {}
-    )
+    # One root span per request so every node's embedding/LLM call nests in one trace.
+    with request_trace(
+        "rag_agent",
+        {"query": state.query, "user_id": state.user_id, "mode": state.mode},
+    ) as span:
+        result = await graph.ainvoke(state.model_dump())
+        final = AgentState(**result)
+        log_chunks_to_trace(span, final.reranked_chunks or final.retrieved_chunks)
+        if span is not None:
+            # The mode is decided inside analyze_query, so record the resolved one on the output.
+            span.set_outputs({"answer": final.answer, "mode": final.mode, "app_timings": final.app_timings})
+        return final
 
-    # Increment loop_count on every re-entry so the grade condition works
-    state = state.model_copy(update={"loop_count": state.loop_count})
 
-    try:
-        result = await graph.ainvoke(state.model_dump(), config=config)
-        return AgentState(**result)
-    finally:
-        if conn is not None:
-            await conn.close()
+if __name__ == "__main__":
+    # Self-check: retrieve-node mode safety (#1) and corrective broadening (#2).
+    class _FakeEmb:
+        async def embed_query(self, text):
+            return [0.0]
+
+    class _FakeRetrieval:
+        def __init__(self):
+            self.calls: List[Dict[str, Any]] = []
+
+        async def retrieve(self, query, query_vector, user_id, mode, top_k, filters):
+            self.calls.append({"mode": mode, "top_k": top_k, "filters": dict(filters)})
+            if mode != "semantic":
+                raise ValueError(f"mode {mode!r} unavailable")   # only semantic "works" here
+            return [{"id": "c1", "score": 1.0, "payload": {"text": "t"}}]
+
+    async def _demo() -> None:
+        global _services
+        fake = _FakeRetrieval()
+        _services = _AgentServices(retrieval=fake, embedding=_FakeEmb(), reranker=None, llm=None)
+        base_top_k = get_settings().retrieval.top_k
+
+        # #1: an unavailable mode degrades to semantic instead of raising.
+        out = await retrieve(AgentState(query="q", user_id="u", mode="hybrid", subqueries=["q"]))
+        assert out["retrieved_chunks"], "should fall back to semantic and return chunks"
+        assert fake.calls[-1]["mode"] == "semantic"
+
+        # #2: a corrective retry broadens — semantic, doubled top_k, explicit filters only.
+        fake.calls.clear()
+        out2 = await retrieve(AgentState(
+            query="q", user_id="u", mode="graph", subqueries=["q"], loop_count=1,
+            filters={"a": "1", "b": "2"}, explicit_filters={"a": "1"},
+        ))
+        last = fake.calls[-1]
+        assert last["mode"] == "semantic"
+        assert last["filters"] == {"a": "1"}            # inferred filter "b" dropped
+        assert last["top_k"] == base_top_k * 2          # widened
+        assert out2["loop_count"] == 2
+        print("OK")
+
+    asyncio.run(_demo())

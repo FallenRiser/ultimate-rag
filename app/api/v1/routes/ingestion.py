@@ -4,10 +4,9 @@ import json
 import mimetypes
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import get_current_user
 from app.models.ingestion import (
     IngestBytesRequest,
     IngestByFilenameRequest,
@@ -90,7 +89,7 @@ async def _ingest_content(
 async def upload_files(
     version: str = Form(...),
     files: List[UploadFile] = File(...),
-    user_id: str = Depends(get_current_user),
+    user_id: str = Form("default"),
 ) -> List[UploadedFile]:
     """Store uploaded files verbatim under {storage_dir}/{user_id}/{version}/. Ingest later
     with POST /ingest/by-filename using the same version + filenames."""
@@ -107,9 +106,9 @@ async def upload_files(
 async def ingest_by_filename(
     request: IngestByFilenameRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user),
 ) -> List[IngestionResponse]:
     """Ingest files already saved via /ingest/upload, located by version + filename."""
+    user_id = request.user_id
     results: List[IngestionResponse] = []
     for filename in request.filenames:
         try:
@@ -132,9 +131,9 @@ async def ingest_by_filename(
 async def ingest_bytes(
     request: IngestBytesRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user),
 ) -> List[IngestionResponse]:
     """Ingest files supplied as base64-encoded bytes in the request body."""
+    user_id = request.user_id
     results: List[IngestionResponse] = []
     for item in request.files:
         try:
@@ -158,7 +157,7 @@ async def ingest_document(
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
     parser_options: Optional[str] = Form(None),
-    user_id: str = Depends(get_current_user),
+    user_id: str = Form("default"),
 ) -> IngestionResponse:
     """Async ingest — registers the document and processes it in a background task.
     `metadata`: JSON object, keys become filterable at query time.
@@ -179,7 +178,7 @@ async def ingest_document_sync(
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
     parser_options: Optional[str] = Form(None),
-    user_id: str = Depends(get_current_user),
+    user_id: str = Form("default"),
 ) -> IngestionResponse:
     """Sync ingest — runs the full pipeline inline and returns the final status.
     `metadata`: JSON object, keys become filterable at query time.
@@ -196,10 +195,7 @@ async def ingest_document_sync(
 
 
 @router.get("/status/{document_id}", response_model=IngestionStatus)
-async def ingestion_status(
-    document_id: str,
-    user_id: str = Depends(get_current_user),
-) -> IngestionStatus:
+async def ingestion_status(document_id: str, user_id: str = "default") -> IngestionStatus:
     engine = get_engine()
     doc = await get_document(engine, document_id, user_id)
     if doc is None:

@@ -3,7 +3,8 @@ import csv
 import io
 from typing import Any, BinaryIO, Dict, List, Optional
 
-from app.services.parsing.base import BaseDocumentParser, PageContent, ParsedDocument
+from app.models.document import PageContent, ParsedDocument
+from app.services.parsing.base import BaseDocumentParser
 
 _SUPPORTED = {
     "application/pdf",

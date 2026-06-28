@@ -17,15 +17,17 @@ logging:
   log_dir: "logs"
   file: "app.log"
   truncate: false
+  preview_chars: 80        # max chars when previewing chunk/query/hash text in logs (0 = full preview)
   rotation_mb: 50
   backups: 5
-  noisy_loggers: ["sqlalchemy", "sqlalchemy.engine", "aiosqlite", "httpcore", "httpx", "openai", "neo4j", "urllib3", "asyncio", "qdrant_client"]
+  noisy_loggers: ["sqlalchemy", "sqlalchemy.engine", "aiosqlite", "httpcore", "httpx", "openai", "urllib3", "asyncio", "qdrant_client"]
 
 observability:
   mlflow:
     enabled: false
     tracking_uri: "http://localhost:5000"
     experiment: "ultimate-rag"
+    max_chunk_chars: 0    # chunk text length recorded in traces (0 = full, no truncation)
     autolog:
       langchain: true   # covers LangGraph
       openai: true
@@ -36,8 +38,9 @@ api:
   port: 8000
   cors_origins: ["*"]
 
-# No auth layer. Callers pass an X-User-Id header; every repository still
-# filters on it for tenant isolation. Absent header → user "default".
+# No auth layer. Callers pass user_id in the request payload (body field, multipart form
+# field, or query param); every repository still filters on it for tenant isolation.
+# Absent → user "default".
 
 database:
   provider: "sqlite"               # postgres | sqlite
@@ -70,12 +73,9 @@ vector_store:
 # --- Knowledge graph (Phase 2; scaffolded now) ------------------------------
 graph_store:
   enabled: true
-  provider: "memgraph"                    # age (needs Postgres) | memgraph (Bolt, standalone)
+  provider: "networkx"               # age (needs Postgres) | networkx (local JSON files, zero infra)
   graph_name: "rag_kg"               # AGE only
-  # memgraph (docker run -p 7687:7687 memgraph/memgraph-mage) — no storage backend to set up
-  memgraph_url: "bolt://localhost:7687"
-  memgraph_user: ""
-  memgraph_password: ""
+  graph_dir: "graph_data"            # networkx: one JSON file per user under this dir
 
 # --- Query cache ------------------------------------------------------------
 cache:
@@ -180,19 +180,41 @@ enrichment:
     enabled: true
     summarize: true
   metadata_extraction:
-    enabled: true                   # LLM-extracted metadata at ingest
-    fields: ["title", "author", "doc_type", "topics"]
+    enabled: true                   # LLM-extracted metadata at ingest (core fields + free-form attributes)
+    max_chars: 0                    # document text sent to the extractor (0 = whole document)
+    attribute_hints: ["topics", "keywords"]   # common free-form attribute keys suggested to the extractor
+  entity_extraction:               # graph entities + relations (only runs when graph_store.enabled)
+    max_chunks: 0                  # chunks scanned for the graph (0 = all)
+    max_chars: 0                   # chars per chunk sent to the extractor (0 = full chunk)
+    embed_entities: true           # embed name+description so queries match entities semantically (not just by string)
+    description_max_chars: 1000    # cap on an entity's merged (multi-mention) description
+    summarize_descriptions: false  # LLM-collapse multi-source descriptions on merge (better quality, +cost)
+  community_detection:             # Louvain communities + LLM reports → global/thematic queries (expensive)
+    enabled: false                 # master switch for the community/global feature
+    rebuild_on_ingest: false       # auto-rebuild after every ingest (small corpora); else POST .../graph/rebuild-communities
+    min_community_size: 3          # skip communities smaller than this
+    max_chars: 4000                # context budget per community-summary LLM call
+  section_metadata:                # per-chunk (section-level) attributes — one LLM call per chunk
+    enabled: false                 # off by default (expensive)
+    max_chunks: 0                  # chunks to extract from (0 = all)
+    max_chars: 0                   # chars per chunk sent to the extractor (0 = full chunk)
+    attribute_hints: []            # common section keys, e.g. ["section", "clause", "price"]
   contextual_retrieval:
     enabled: false                   # prepend doc-level context to each chunk
 
 # --- Retrieval --------------------------------------------------------------
 retrieval:
-  default_mode: "graph"             # semantic | bm25 | graph | hybrid | hybrid_graph
+  default_mode: "graph"             # semantic | bm25 | graph | hybrid | hybrid_graph | graph_global (thematic)
   top_k: 20
   fusion: "rrf"                      # rrf | weighted
   rrf_k: 60
   weights: { dense: 0.6, sparse: 0.4 }
   rerank_top_k: 8
+  graph_hops: 1                      # graph mode: relation-edges traversed from matched entities (0 = direct mentions only)
+  graph_query_entities: "regex"      # query seed entities: "regex" (cheap, no LLM) | "llm" (one extra call, better recall)
+  graph_seed_top_k: 8                # entities used to seed local graph retrieval (semantic match, falls back to string)
+  graph_dual_level: true             # local graph mode also blends the seed entities' community summaries (needs community_detection)
+  graph_global_top_k: 8              # community summaries pulled in graph_global (thematic) mode
 
 # --- Agent ------------------------------------------------------------------
 agent:
@@ -202,14 +224,17 @@ agent:
   decompose: true
   max_subqueries: 4
   grade_relevance: true
+  grade_max_chunks: 3                # chunks sent to the relevance grader (0 = all)
   max_retrieval_loops: 2
   context_exploration: false         # retrieve a few snippets first to ground rewrite/decompose
   context_exploration_top_k: 3
   tools:
     max_tool_calls: 8                # hard budget for the tools agent (prevents runaway loops)
   auto_filter:
-    enabled: false                   # LLM infers metadata filters from the query (applies to /query and /chat)
-    fields: ["doc_type", "author"]   # only these metadata fields may be auto-filtered
+    enabled: true                    # LLM infers metadata filters from the query (applies to /query and /chat)
+    fields: ["doc_type", "language"] # core fields allowed as filters (categorical, normalized)
+    use_catalog: true                # also allow discovered free-form attribute keys (per-tenant catalog)
+    max_catalog_keys: 50             # cap attribute keys fed to the LLM
 
 # --- Ingestion (in-process: background task or POST /ingest/sync) -----------
 ingestion:
@@ -220,6 +245,4 @@ ingestion:
 # --- Chat sessions ----------------------------------------------------------
 chat:
   memory_enabled: true
-  max_turns: 20
-  checkpointer: "memory"           # postgres | memory | sqlite
-  sqlite_path: "chat_memory.db"    # used when checkpointer = sqlite (zero-infra persistence)
+  max_turns: 20                    # turns of history loaded from chat_messages and fed to the agent

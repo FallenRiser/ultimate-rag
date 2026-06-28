@@ -17,13 +17,8 @@ def create_graph_store() -> Optional[BaseGraphStore]:
             graph_name=settings.graph_store.graph_name,
         )
 
-    if provider == "memgraph":
-        from app.repositories.graph.memgraph import MemgraphRepository
-        cfg = settings.graph_store
-        return MemgraphRepository(
-            url=cfg.memgraph_url,
-            user=cfg.memgraph_user,
-            password=cfg.memgraph_password,
-        )
+    if provider == "networkx":
+        from app.repositories.graph.networkx_store import NetworkXRepository
+        return NetworkXRepository(graph_dir=settings.graph_store.graph_dir)
 
     raise ValueError(f"Unknown graph_store.provider: {provider!r}")

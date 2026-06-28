@@ -2,7 +2,8 @@ from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 import httpx
 
-from app.services.parsing.base import BaseDocumentParser, ParsedDocument
+from app.models.document import ParsedDocument
+from app.services.parsing.base import BaseDocumentParser
 from app.utils.config import DoclingSettings
 
 

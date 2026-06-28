@@ -11,10 +11,15 @@ def create_llm_provider() -> BaseLLMProvider:
 
     if provider in ("openai", "vllm"):
         from app.services.llm.openai_provider import OpenAIProvider
-        # Env (OPENAI_API_KEY / OPENAI_BASE_URL) takes precedence, then config.
+        # vllm needs its configured base_url; openai → the real OpenAI API unless an endpoint is
+        # given via env (cfg.base_url defaults to the Ollama URL, which would silently misroute).
+        if provider == "vllm":
+            base_url = os.getenv("OPENAI_BASE_URL") or cfg.base_url
+        else:
+            base_url = os.getenv("OPENAI_BASE_URL") or None
         return OpenAIProvider(
             api_key=os.getenv("OPENAI_API_KEY") or cfg.api_key or "",
-            base_url=os.getenv("OPENAI_BASE_URL") or cfg.base_url,
+            base_url=base_url,
             model=cfg.model,
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,

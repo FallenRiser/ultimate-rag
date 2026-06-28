@@ -8,14 +8,23 @@ from app.repositories.base import BaseVectorDB
 
 
 def _metadata_filter_sql(filters: Optional[Dict[str, Any]], params: Dict[str, Any]) -> str:
-    """Build `AND metadata ->> :fkN = :fvN` clauses. Keys are bound as params (no injection)."""
+    """Build `AND metadata ->> :fkN ...` clauses. A scalar matches exactly; a list matches ANY
+    of its values (OR within the key, via IN). Keys/values bound as params (no injection)."""
     if not filters:
         return ""
     clauses = ""
     for i, (key, value) in enumerate(filters.items()):
-        clauses += f" AND metadata ->> :fk{i} = :fv{i}"
         params[f"fk{i}"] = key
-        params[f"fv{i}"] = str(value)
+        if isinstance(value, (list, tuple, set)):
+            placeholders = []
+            for j, item in enumerate(value):
+                params[f"fv{i}_{j}"] = str(item)
+                placeholders.append(f":fv{i}_{j}")
+            if placeholders:
+                clauses += f" AND metadata ->> :fk{i} IN ({', '.join(placeholders)})"
+        else:
+            params[f"fv{i}"] = str(value)
+            clauses += f" AND metadata ->> :fk{i} = :fv{i}"
     return clauses
 
 

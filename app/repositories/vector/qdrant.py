@@ -6,6 +6,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    MatchAny,
     MatchValue,
     PointStruct,
     SparseVector,
@@ -37,10 +38,15 @@ class QdrantRepository(BaseVectorDB):
         return self._sparse_model
 
     def _build_filter(self, user_id: str, filters: Optional[Dict[str, Any]] = None) -> Filter:
-        # user_id is always enforced; extra filters match metadata.<key> exactly.
+        # user_id is always enforced. A scalar filter matches exactly; a list matches ANY of
+        # its values (OR within the key). Different keys AND together.
         must = [FieldCondition(key="metadata.user_id", match=MatchValue(value=user_id))]
         for key, value in (filters or {}).items():
-            must.append(FieldCondition(key=f"metadata.{key}", match=MatchValue(value=value)))
+            if isinstance(value, (list, tuple, set)):
+                match = MatchAny(any=list(value))
+            else:
+                match = MatchValue(value=value)
+            must.append(FieldCondition(key=f"metadata.{key}", match=match))
         return Filter(must=must)
 
     async def _embed_sparse(self, texts: List[str]) -> List[SparseVector]:

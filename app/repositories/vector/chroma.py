@@ -5,11 +5,15 @@ from app.repositories.base import BaseVectorDB
 
 
 def _build_where(user_id: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Chroma where-clause: user_id always enforced, plus exact metadata matches.
-    Multiple conditions must be combined with $and."""
-    conditions = [{"user_id": user_id}]
+    """Chroma where-clause: user_id always enforced, plus metadata matches. A scalar matches
+    exactly; a list matches ANY of its values (OR within the key, via $in). Multiple
+    conditions combine with $and."""
+    conditions: List[Dict[str, Any]] = [{"user_id": user_id}]
     for key, value in (filters or {}).items():
-        conditions.append({key: value})
+        if isinstance(value, (list, tuple, set)):
+            conditions.append({key: {"$in": list(value)}})
+        else:
+            conditions.append({key: value})
     return conditions[0] if len(conditions) == 1 else {"$and": conditions}
 
 

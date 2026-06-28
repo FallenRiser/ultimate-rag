@@ -6,13 +6,18 @@ from pydantic import BaseModel, Field
 
 class QueryRequest(BaseModel):
     query: str
-    user_id: str
+    user_id: str = "default"             # tenant id; supplied in the payload (no auth layer)
     session_id: Optional[str] = None
     mode: Optional[str] = None           # overrides config default if set
     filters: Dict[str, Any] = Field(default_factory=dict)
     top_k: Optional[int] = None
     use_agent: Optional[bool] = None     # None → follow config agent.enabled; True/False overrides
     agent_style: Optional[str] = None    # None → follow config agent.style; "graph" | "tools"
+
+
+class QueryEntities(BaseModel):
+    """LLM-extracted entity names from a user query, used to seed graph retrieval."""
+    entities: List[str] = Field(default_factory=list)
 
 
 class SourceChunk(BaseModel):

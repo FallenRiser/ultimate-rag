@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -50,3 +50,18 @@ class DocumentChunk(BaseModel):
     page: Optional[int] = None
     text: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+# Parser output (returned by BaseDocumentParser.parse)
+
+class PageContent(BaseModel):
+    page_no: int
+    text: str
+    images: List[str] = []   # base64-encoded image strings
+    tables: List[str] = []   # markdown-formatted table strings
+
+
+class ParsedDocument(BaseModel):
+    text: str                            # full concatenated text
+    pages: List[PageContent] = []
+    metadata: Dict[str, Any] = {}

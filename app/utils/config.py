@@ -49,11 +49,12 @@ class LoggingSettings(BaseModel):
     log_dir: str = "logs"
     file: str = "app.log"
     truncate: bool = False
+    preview_chars: int = 80   # max chars when previewing chunk/query/hash text in logs (0 = full)
     rotation_mb: int = 50
     backups: int = 5
     noisy_loggers: List[str] = [
         "sqlalchemy", "sqlalchemy.engine", "aiosqlite", "httpcore", "httpx",
-        "openai", "neo4j", "urllib3", "asyncio", "qdrant_client",
+        "openai", "urllib3", "asyncio", "qdrant_client",
     ]
 
 
@@ -68,6 +69,7 @@ class MLflowSettings(BaseModel):
     tracking_uri: str = "http://localhost:5000"
     experiment: str = "ultimate-rag"
     autolog: MLflowAutologSettings = MLflowAutologSettings()
+    max_chunk_chars: int = 0   # chunk text length recorded in traces (0 = full)
 
 
 class ObservabilitySettings(BaseModel):
@@ -103,11 +105,9 @@ class VectorStoreSettings(BaseModel):
 
 class GraphStoreSettings(BaseModel):
     enabled: bool = False
-    provider: str = "age"             # age (Postgres) | memgraph (Bolt)
+    provider: str = "networkx"        # age (Postgres) | networkx (local JSON files, zero infra)
     graph_name: str = "rag_kg"        # AGE only
-    memgraph_url: str = "bolt://localhost:7687"
-    memgraph_user: str = ""
-    memgraph_password: str = ""
+    graph_dir: str = "graph_data"     # networkx: one JSON file per user under this dir
 
 
 class CacheSettings(BaseModel):
@@ -224,7 +224,34 @@ class TableExtractionSettings(BaseModel):
 
 class MetadataExtractionSettings(BaseModel):
     enabled: bool = False
-    fields: List[str] = ["title", "author", "doc_type", "topics"]
+    max_chars: int = 0   # document text sent to the extractor (0 = whole document)
+    # Common free-form attribute keys suggested to the extractor (core fields are in code).
+    attribute_hints: List[str] = ["topics", "keywords"]
+
+
+class EntityExtractionSettings(BaseModel):
+    max_chunks: int = 0   # chunks scanned for graph entities (0 = all)
+    max_chars: int = 0    # chars per chunk sent to the extractor (0 = full chunk)
+    embed_entities: bool = True       # embed name+description for semantic query→entity matching
+    description_max_chars: int = 1000  # cap on an entity's merged (multi-mention) description
+    summarize_descriptions: bool = False  # LLM-collapse multi-source descriptions on merge (+cost)
+
+
+class CommunityDetectionSettings(BaseModel):
+    """Louvain communities + LLM community reports — powers global/thematic queries."""
+    enabled: bool = False             # master switch for the community/global feature
+    rebuild_on_ingest: bool = False   # auto-rebuild after every ingest (small corpora only — re-clusters
+                                      # the whole tenant graph). Default off: rebuild via the endpoint instead.
+    min_community_size: int = 3       # skip communities smaller than this
+    max_chars: int = 4000             # context budget per community-summary LLM call
+
+
+class SectionMetadataSettings(BaseModel):
+    """Per-chunk (section-level) attribute extraction. Off by default — one LLM call per chunk."""
+    enabled: bool = False
+    max_chunks: int = 0   # chunks to extract section metadata from (0 = all — expensive)
+    max_chars: int = 0    # chars per chunk sent to the extractor (0 = full chunk)
+    attribute_hints: List[str] = []   # common section-level keys (e.g. section, clause, price)
 
 
 class ContextualRetrievalSettings(BaseModel):
@@ -235,6 +262,9 @@ class EnrichmentSettings(BaseModel):
     image_captioning: ImageCaptioningSettings = ImageCaptioningSettings()
     table_extraction: TableExtractionSettings = TableExtractionSettings()
     metadata_extraction: MetadataExtractionSettings = MetadataExtractionSettings()
+    entity_extraction: EntityExtractionSettings = EntityExtractionSettings()
+    community_detection: CommunityDetectionSettings = CommunityDetectionSettings()
+    section_metadata: SectionMetadataSettings = SectionMetadataSettings()
     contextual_retrieval: ContextualRetrievalSettings = ContextualRetrievalSettings()
 
 
@@ -244,17 +274,24 @@ class RetrievalWeights(BaseModel):
 
 
 class RetrievalSettings(BaseModel):
-    default_mode: str = "hybrid"      # semantic | bm25 | graph | hybrid | hybrid_graph
+    default_mode: str = "hybrid"      # semantic | bm25 | graph | hybrid | hybrid_graph | graph_global
     top_k: int = 20
     fusion: str = "rrf"
     rrf_k: int = 60
     weights: RetrievalWeights = RetrievalWeights()
     rerank_top_k: int = 8
+    graph_hops: int = 1               # graph mode: relation-edges traversed from matched entities (0 = no expansion)
+    graph_query_entities: str = "regex"  # how query seed entities are found: "regex" (cheap) | "llm" (one extra call)
+    graph_seed_top_k: int = 8         # entities used to seed local graph retrieval (semantic or string match)
+    graph_dual_level: bool = True     # local graph mode also blends the seed entities' community summaries
+    graph_global_top_k: int = 8       # community summaries pulled in graph_global (thematic) mode
 
 
 class AutoFilterSettings(BaseModel):
-    enabled: bool = False                       # LLM infers metadata filters from the query
-    fields: List[str] = ["doc_type", "author"]  # only these fields may be auto-filtered
+    enabled: bool = False                          # LLM infers metadata filters from the query
+    fields: List[str] = ["doc_type", "language"]   # core fields allowed as filters (normalized)
+    use_catalog: bool = True                       # also allow discovered free-form attribute keys
+    max_catalog_keys: int = 50                     # cap attribute keys fed to the LLM
 
 
 class AgentToolsSettings(BaseModel):
@@ -268,6 +305,7 @@ class AgentSettings(BaseModel):
     decompose: bool = True
     max_subqueries: int = 4
     grade_relevance: bool = True
+    grade_max_chunks: int = 3             # chunks sent to the relevance grader (0 = all)
     max_retrieval_loops: int = 2
     context_exploration: bool = False     # retrieve a few snippets first to ground rewrite/decompose
     context_exploration_top_k: int = 3
@@ -283,9 +321,7 @@ class IngestionSettings(BaseModel):
 
 class ChatSettings(BaseModel):
     memory_enabled: bool = True
-    max_turns: int = 20
-    checkpointer: str = "postgres"      # postgres | memory | sqlite
-    sqlite_path: str = "chat_memory.db"  # used when checkpointer == sqlite
+    max_turns: int = 20   # turns of history loaded from chat_messages and fed to the agent
 
 
 # ---------------------------------------------------------------------------

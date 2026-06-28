@@ -14,12 +14,10 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
-    # --- graph store (optional) ---
-    "neo4j>=5.0",                   # Bolt driver — also used for Memgraph
+    # --- graph store ---
+    "networkx>=3.0",                # local JSON-file graph store (zero infra); AGE for Postgres
     # --- agent / orchestration ---
     "langgraph>=0.2",
-    "langgraph-checkpoint-postgres>=2.0",
-    "langgraph-checkpoint-sqlite>=2.0",   # sqlite chat memory
     "langchain-core>=0.3",
     "deepagents>=0.5",                    # planner + sub-agents agent (agent.style=deep)
     # --- llm / embedding clients (all via LangChain) ---

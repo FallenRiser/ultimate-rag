@@ -1,3 +1,4 @@
+import logging
 import math
 from typing import List, Optional
 
@@ -5,6 +6,8 @@ import tiktoken
 from langchain_ollama import OllamaEmbeddings as _LangchainOllamaEmbeddings
 
 from app.services.embeddings.base import BaseEmbeddingProvider
+
+logger = logging.getLogger(__name__)
 
 _ENCODING = "cl100k_base"
 
@@ -29,12 +32,20 @@ class OllamaEmbeddings(BaseEmbeddingProvider):
 
     def _truncate(self, text: str) -> str:
         # Hard client-side cap. Small-context models (mxbai=512) reject longer inputs and
-        # Ollama's server-side truncate is unreliable on its new engine.
+        # Ollama's server-side truncate is unreliable on its new engine. This caps the text
+        # that gets EMBEDDED only; the stored chunk text is untouched. Chunk size should be
+        # aligned to this cap so it rarely fires — when it does, the chunk's tail is excluded
+        # from its vector, which silently hurts recall, so we log it.
         if not self.max_input_tokens:
             return text
         tokens = self._enc.encode(text)
         if len(tokens) <= self.max_input_tokens:
             return text
+        logger.warning(
+            "Embedding input truncated: %d -> %d tokens. The chunk tail is excluded from its "
+            "vector — lower chunking.chunk_size or raise embeddings.max_input_tokens to fix.",
+            len(tokens), self.max_input_tokens,
+        )
         return self._enc.decode(tokens[: self.max_input_tokens])
 
     async def embed_documents(self, texts: List[str]) -> List[List[float]]:

@@ -1,8 +1,8 @@
 import logging
+import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 
-from app.api.deps import get_current_user
 from app.models.query import Citation, QueryRequest, QueryResponse, SourceChunk
 from app.services.citation.builder import build_citation
 from app.services.retrieval.pipeline import get_query_pipeline
@@ -13,13 +13,8 @@ router = APIRouter(prefix="/query", tags=["query"])
 
 
 @router.post("", response_model=QueryResponse)
-async def query(
-    request: QueryRequest,
-    user_id: str = Depends(get_current_user),
-) -> QueryResponse:
-    # X-User-Id header overrides any user_id in the request body — isolation guarantee
-    request.user_id = user_id
-
+async def query(request: QueryRequest) -> QueryResponse:
+    # user_id is taken from the request payload; repositories filter on it for isolation.
     settings = get_settings()
     use_agent = request.use_agent if request.use_agent is not None else settings.agent.enabled
     style = request.agent_style or settings.agent.style
@@ -42,7 +37,8 @@ async def query(
 
 async def _run_agent_query(request: QueryRequest) -> QueryResponse:
     """Run the LangGraph agent (rewrite/decompose/grade-loop) for a stateless /query call."""
-    from app.services.agent.graph import AgentState, run_agent
+    from app.models.agent import AgentState
+    from app.services.agent.graph import run_agent
 
     logger.info("Routing query through the agent")
     state = AgentState(
@@ -85,13 +81,16 @@ async def _run_tool_agent_query(request: QueryRequest, style: str) -> QueryRespo
     from app.services.agent.tool_agent import run_tool_agent
 
     mode = request.mode or get_settings().retrieval.default_mode
+    start = time.perf_counter()
     answer, chunks = await run_tool_agent(
         request.query, request.user_id, mode, request.filters, deep=(style == "deep")
     )
+    elapsed_ms = round((time.perf_counter() - start) * 1000.0, 1)
     citation = build_citation(_dedupe_by_id(chunks))
     return QueryResponse(
         answer=answer or "I was unable to generate an answer.",
         citations=citation,
         mode_used=f"{style}:{mode}",
         session_id=request.session_id,
+        app_timings={"tool_agent": elapsed_ms, "total": elapsed_ms},
     )

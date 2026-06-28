@@ -9,20 +9,12 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.observability.tracing import log_chunks_to_trace, request_trace
+from app.prompts.agent import TOOL_AGENT_SYSTEM
 from app.services.agent.graph import _get_services
 from app.utils.config import get_settings
 
 logger = logging.getLogger(__name__)
-
-_SYSTEM = (
-    "You are a retrieval agent answering questions over a private knowledge base. "
-    "Use the tools to search as many times as needed — rewrite or decompose the question "
-    "yourself between searches when it helps you find better evidence. "
-    "Retrieval modes: 'semantic' (always available), 'bm25'/'hybrid' (keyword + semantic), "
-    "'graph'/'hybrid_graph' (entity knowledge graph). If a mode errors, fall back to 'semantic'. "
-    "When you have enough evidence, answer concisely using ONLY what the tools returned. "
-    "If the knowledge base does not contain the answer, say so plainly."
-)
 
 
 def _build_chat_model():
@@ -34,8 +26,12 @@ def _build_chat_model():
         base = cfg.base_url.rstrip("/")
         base_url = base if base.endswith("/v1") else f"{base}/v1"
         api_key = "ollama"  # ignored by Ollama, but the client requires a value
-    else:
+    elif cfg.provider == "vllm":
         base_url = os.getenv("OPENAI_BASE_URL") or cfg.base_url
+        api_key = os.getenv("OPENAI_API_KEY") or cfg.api_key or "missing"
+    else:  # openai → the real OpenAI API; ignore llm.base_url (defaults to the Ollama URL) unless
+           # an OpenAI endpoint is explicitly given via env. base_url=None → ChatOpenAI uses OpenAI.
+        base_url = os.getenv("OPENAI_BASE_URL") or None
         api_key = os.getenv("OPENAI_API_KEY") or cfg.api_key or "missing"
 
     return ChatOpenAI(model=cfg.model, base_url=base_url, api_key=api_key, temperature=cfg.temperature)
@@ -46,9 +42,22 @@ def _format_chunks(chunks: List[Dict[str, Any]]) -> str:
         return "No results."
     blocks = []
     for chunk in chunks:
-        text = chunk.get("payload", {}).get("text", "")[:500]
+        text = chunk.get("payload", {}).get("text", "")
         blocks.append(f"[{chunk.get('id')}] {text}")
     return "\n\n".join(blocks)
+
+
+def _message_text(content: Any) -> str:
+    """LangChain message content is usually a string but can be a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block if isinstance(block, str) else block.get("text", "")
+            for block in content
+            if isinstance(block, (str, dict))
+        )
+    return str(content)
 
 
 def _make_tools(user_id: str, filters: Dict[str, Any], collector: List[Dict[str, Any]]) -> list:
@@ -60,7 +69,8 @@ def _make_tools(user_id: str, filters: Dict[str, Any], collector: List[Dict[str,
 
     @tool
     async def search_documents(query: str, mode: str = "semantic", top_k: int = 10) -> str:
-        """Search the knowledge base. mode is one of: semantic, bm25, hybrid, graph, hybrid_graph.
+        """Search the knowledge base. mode is one of: semantic, bm25, hybrid, graph, hybrid_graph,
+        graph_global (broad/thematic questions about the whole knowledge base).
         Returns matching chunks as "[chunk_id] text". Use semantic if unsure."""
         try:
             query_vector = await svc.embedding.embed_query(query)
@@ -77,7 +87,13 @@ def _make_tools(user_id: str, filters: Dict[str, Any], collector: List[Dict[str,
     async def list_document_chunks(document_id: str) -> str:
         """Return all chunks of one document (by its document_id) in order — use to read a
         document fully once you have identified it from a search result's metadata."""
-        chunks = await svc.retrieval.vector_db.list_by_document(document_id, user_id)
+        try:
+            chunks = await svc.retrieval.vector_db.list_by_document(document_id, user_id)
+        except Exception as exc:
+            # Non-breaking: return a recoverable message so the LLM can continue.
+            logger.warning("list_document_chunks failed for %s: %s", document_id, exc)
+            logger.debug("list_document_chunks failure (doc=%s)", document_id, exc_info=True)
+            return f"Could not read document {document_id}: {exc}"
         chunks.sort(key=lambda c: c.get("payload", {}).get("metadata", {}).get("ordinal", 0))
         collector.extend(chunks)
         return _format_chunks(chunks)
@@ -114,17 +130,33 @@ async def run_tool_agent(
     collector: List[Dict[str, Any]] = []
     model = _build_chat_model()
     tools = _make_tools(user_id, filters, collector)
-    prompt = f"{_SYSTEM}\nPreferred retrieval mode: {mode}. Use it first; fall back to 'semantic' if it errors."
+    prompt = f"{TOOL_AGENT_SYSTEM}\nPreferred retrieval mode: {mode}. Use it first; fall back to 'semantic' if it errors."
     agent = _build_agent(model, tools, prompt, deep)
 
     # Deep agents take extra steps for planning/sub-agents, so allow a larger budget.
     recursion_limit = max_calls * (3 if deep else 2) + (10 if deep else 1)
 
+    from langgraph.errors import GraphRecursionError
+
     messages = list(history or []) + [{"role": "user", "content": query}]
     logger.info("Tool agent running (style=%s, mode=%s, max_tool_calls=%d)",
                 "deep" if deep else "tools", mode, max_calls)
-    result = await agent.ainvoke({"messages": messages}, config={"recursion_limit": recursion_limit})
 
-    answer = result["messages"][-1].content
+    # One root span per request so every tool's embedding/LLM call nests in one trace.
+    answer = ""
+    with request_trace("rag_tool_agent", {"query": query, "user_id": user_id, "mode": mode}) as span:
+        try:
+            result = await agent.ainvoke({"messages": messages}, config={"recursion_limit": recursion_limit})
+            answer = _message_text(result["messages"][-1].content)
+        except GraphRecursionError as exc:
+            # Non-breaking: ran past the step budget. Return a best-effort answer — the route
+            # still gets whatever chunks the tools gathered. Other errors propagate to the route.
+            logger.warning("Tool agent hit recursion_limit=%d; returning best-effort answer: %s", recursion_limit, exc)
+            logger.debug("Tool agent recursion limit (query=%r)", query, exc_info=True)
+            answer = "I couldn't fully complete the search within the allowed steps. Try narrowing the question."
+        log_chunks_to_trace(span, collector)
+        if span is not None:
+            span.set_outputs({"answer": answer})
+
     logger.info("Tool agent done: %d chunks retrieved across tool calls", len(collector))
     return answer, collector

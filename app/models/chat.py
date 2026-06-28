@@ -24,7 +24,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    user_id: str
+    user_id: str = "default"             # tenant id; supplied in the payload (no auth layer)
     session_id: Optional[str] = None
     filters: Dict[str, Any] = Field(default_factory=dict)
     agent_style: Optional[str] = None    # None → follow config agent.style; "graph" | "tools"

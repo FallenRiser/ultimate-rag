@@ -1,21 +1,29 @@
 import logging
+import time
 from typing import Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.api.deps import get_current_user
+from app.models.agent import AgentState
 from app.models.chat import ChatMessage, ChatRequest, ChatResponse, ChatSession
+from app.models.common import PaginatedResponse
 from app.repositories.relational.database import get_engine
-from app.repositories.relational.messages import add_message, list_recent_messages
+from app.repositories.relational.messages import (
+    add_message,
+    count_messages,
+    list_messages,
+    list_recent_messages,
+)
 from app.repositories.relational.sessions import (
+    count_sessions,
     create_session,
     delete_session,
     get_session,
     list_sessions,
     touch_session,
 )
-from app.services.agent.graph import AgentState, run_agent
+from app.services.agent.graph import run_agent
 from app.utils.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -29,10 +37,8 @@ async def _load_history(engine: AsyncEngine, session_id: str, user_id: str) -> L
 
 
 @router.post("", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
-    user_id: str = Depends(get_current_user),
-) -> ChatResponse:
+async def chat(request: ChatRequest) -> ChatResponse:
+    user_id = request.user_id   # tenant id from the payload; repositories filter on it
     engine = get_engine()
 
     # Resolve or create session
@@ -50,24 +56,38 @@ async def chat(
     logger.info("Received chat message")
     logger.debug("Received chat message: %r user_id=%s session_id=%s", request.message, user_id, session_id)
 
-    # Prior turns drive follow-up resolution (the agent contextualizes against them).
+    # Prior turns drive follow-up resolution. Load BEFORE saving the new message so it isn't
+    # duplicated into the agent's history.
     history = await _load_history(engine, session_id, user_id)
 
-    style = request.agent_style or get_settings().agent.style
-    if style in ("tools", "deep"):
-        answer, citations, timings = await _run_tool_agent_chat(request, user_id, history, style)
-    else:
-        answer, citations, timings = await _run_graph_agent_chat(request, user_id, session_id, history)
-
-    # Persist the turn so the next message can use it as history.
+    # Persist the user's message immediately so a failed turn is never lost.
     user_message = ChatMessage(session_id=session_id, role="user", content=request.message)
+    await add_message(engine, user_message, user_id)
+
+    try:
+        style = request.agent_style or get_settings().agent.style
+        if style in ("tools", "deep"):
+            answer, citations, timings = await _run_tool_agent_chat(request, user_id, history, style)
+        else:
+            answer, citations, timings = await _run_graph_agent_chat(request, user_id, session_id, history)
+    except (ValueError, NotImplementedError) as exc:
+        # Client/config error — handled, non-breaking for the server.
+        logger.warning("Chat rejected for session %s: %s", session_id, exc)
+        status = 400 if isinstance(exc, ValueError) else 501
+        raise HTTPException(status_code=status, detail=str(exc))
+    except Exception as exc:
+        # Unexpected — breaking; log with traceback and surface a 500. The user message is
+        # already saved, so the turn isn't lost.
+        logger.error("Chat failed for session %s: %s", session_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal error processing chat")
+
+    # Persist the assistant turn (with citations) so history can be re-rendered.
     assistant_message = ChatMessage(
         session_id=session_id,
         role="assistant",
         content=answer,
         citations={"source_chunks": citations},
     )
-    await add_message(engine, user_message, user_id)
     await add_message(engine, assistant_message, user_id)
 
     logger.info("Chat complete: %s", timings)
@@ -108,9 +128,11 @@ async def _run_tool_agent_chat(
     from app.services.citation.builder import build_citation
 
     mode = get_settings().retrieval.default_mode
+    start = time.perf_counter()
     answer, chunks = await run_tool_agent(
         request.message, user_id, mode, request.filters, history, deep=(style == "deep")
     )
+    elapsed_ms = round((time.perf_counter() - start) * 1000.0, 1)
 
     seen: set = set()
     unique = []
@@ -121,21 +143,42 @@ async def _run_tool_agent_chat(
             unique.append(chunk)
     citation = build_citation(unique)
     citations = [chunk.model_dump() for chunk in citation.source_chunks]
-    return answer or "I was unable to generate an answer.", citations, {}
+    timings = {"tool_agent": elapsed_ms, "total": elapsed_ms}
+    return answer or "I was unable to generate an answer.", citations, timings
 
 
-@router.get("/sessions", response_model=list[ChatSession])
+@router.get("/sessions", response_model=PaginatedResponse[ChatSession])
 async def list_user_sessions(
-    user_id: str = Depends(get_current_user),
-) -> list[ChatSession]:
-    return await list_sessions(get_engine(), user_id)
+    user_id: str = "default",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+) -> PaginatedResponse[ChatSession]:
+    engine = get_engine()
+    offset = (page - 1) * page_size
+    items = await list_sessions(engine, user_id, page_size, offset)
+    total = await count_sessions(engine, user_id)
+    return PaginatedResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/sessions/{session_id}/messages", response_model=PaginatedResponse[ChatMessage])
+async def get_session_messages(
+    session_id: str,
+    user_id: str = "default",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+) -> PaginatedResponse[ChatMessage]:
+    """Render an existing conversation: messages in chronological order, paginated."""
+    engine = get_engine()
+    if await get_session(engine, session_id, user_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    offset = (page - 1) * page_size
+    items = await list_messages(engine, session_id, user_id, page_size, offset)
+    total = await count_messages(engine, session_id, user_id)
+    return PaginatedResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_user_session(
-    session_id: str,
-    user_id: str = Depends(get_current_user),
-) -> dict:
+async def delete_user_session(session_id: str, user_id: str = "default") -> dict:
     deleted = await delete_session(get_engine(), session_id, user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")

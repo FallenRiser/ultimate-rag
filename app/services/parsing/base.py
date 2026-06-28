@@ -1,20 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Any, BinaryIO, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, Optional
 
-from pydantic import BaseModel  # noqa: F401  (re-exported for parser models)
-
-
-class PageContent(BaseModel):
-    page_no: int
-    text: str
-    images: List[str] = []   # base64-encoded image strings
-    tables: List[str] = []   # markdown-formatted table strings
-
-
-class ParsedDocument(BaseModel):
-    text: str                            # full concatenated text
-    pages: List[PageContent] = []
-    metadata: Dict[str, Any] = {}
+from app.models.document import ParsedDocument
 
 
 class BaseDocumentParser(ABC):
